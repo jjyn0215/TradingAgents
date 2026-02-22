@@ -20,9 +20,14 @@ from dotenv import load_dotenv
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
-from kis_client import KISClient, format_krw
+from kis_client import KISClient, format_krw, format_usd
 from trade_history import (
-    record_trade, record_pnl, get_total_pnl, get_recent_pnl, get_ticker_summary,
+    record_trade,
+    record_pnl,
+    get_total_pnl,
+    get_total_pnl_by_currency,
+    get_recent_pnl,
+    get_ticker_summary,
     is_action_done, mark_action_done, get_daily_state,
 )
 
@@ -61,6 +66,14 @@ AUTO_SELL_TIME = os.getenv("AUTO_SELL_TIME", "15:20")        # 자동 매도 시
 _buy_h, _buy_m = (int(x) for x in AUTO_BUY_TIME.split(":"))
 _sell_h, _sell_m = (int(x) for x in AUTO_SELL_TIME.split(":"))
 
+# 미국 데이 트레이딩 설정
+ENABLE_US_TRADING = os.getenv("ENABLE_US_TRADING", "false").lower() == "true"
+US_DAY_TRADE_PICKS = int(os.getenv("US_DAY_TRADE_PICKS", "5"))
+US_AUTO_BUY_TIME = os.getenv("US_AUTO_BUY_TIME", "09:35")
+US_AUTO_SELL_TIME = os.getenv("US_AUTO_SELL_TIME", "15:50")
+_us_buy_h, _us_buy_m = (int(x) for x in US_AUTO_BUY_TIME.split(":"))
+_us_sell_h, _us_sell_m = (int(x) for x in US_AUTO_SELL_TIME.split(":"))
+
 config = DEFAULT_CONFIG.copy()
 config["deep_think_llm"] = os.getenv("DEEP_THINK_LLM", "gemini-3-flash-preview")
 config["quick_think_llm"] = os.getenv("QUICK_THINK_LLM", "gemini-3-flash-preview")
@@ -85,6 +98,7 @@ _analysis_lock = asyncio.Lock()
 # ─── KIS 클라이언트 초기화 ──────────────────────────────────
 kis = KISClient()
 KST = ZoneInfo("Asia/Seoul")
+NY_TZ = ZoneInfo("America/New_York")
 TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
 
 
@@ -105,12 +119,27 @@ def _yf_ticker(ticker: str) -> str:
     예: '005930' → '005930.KS', 'AAPL' → 'AAPL' (변경 없음)
     이미 .KS/.KQ가 붙어있으면 그대로 유지.
     """
+    ticker = (ticker or "").upper()
     if ticker.endswith((".KS", ".KQ")):
         return ticker
     # 6자리 숫자면 코스피 종목
     if ticker.isdigit() and len(ticker) == 6:
         return f"{ticker}.KS"
     return ticker
+
+
+def _market_of_ticker(ticker: str) -> str:
+    return kis.detect_market(ticker)
+
+
+def _currency_of_market(market: str) -> str:
+    return "USD" if market == "US" else "KRW"
+
+
+def _format_money(amount: float, currency: str) -> str:
+    if currency == "USD":
+        return format_usd(amount)
+    return f"{amount:,.0f}원"
 
 
 def _parse_trade_date(date_text: str | None) -> str:
@@ -135,10 +164,12 @@ def _validate_ticker_format(ticker: str) -> str | None:
 
 def _ticker_has_market_data(ticker: str) -> bool:
     """실제 종목 데이터가 존재하는지 확인."""
+    market = _market_of_ticker(ticker)
+
     # 한국 6자리 종목은 KIS 시세를 우선 확인
-    if ticker.isdigit() and len(ticker) == 6 and kis.is_configured:
+    if market == "KR" and kis.is_configured:
         try:
-            return kis.get_price(ticker) > 0
+            return kis.get_price(ticker, market="KR") > 0
         except Exception as e:
             _log("WARN", "TICKER_VALIDATE_KIS_FAIL", f"ticker={ticker} error={str(e)[:160]}")
 
@@ -169,29 +200,23 @@ async def _validate_analysis_ticker(ticker: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _is_market_day() -> bool:
-    """오늘이 한국 주식시장 거래일인지 KIS API로 판단.
+def _is_market_day(market: str = "KR") -> bool:
+    """시장 거래일 여부 확인."""
+    market = market.upper()
+    now = datetime.datetime.now(NY_TZ if market == "US" else KST).date()
+    if market == "US":
+        return kis.is_market_open(now, market="US")
 
-    KIS API 미설정 시 주말만 체크합니다.
-    """
-    today = datetime.datetime.now(KST).date()
-    # 주말은 API 없이도 확정
-    if today.weekday() >= 5:
+    if now.weekday() >= 5:
         return False
-    # KIS 설정돼있으면 공식 휴장일 조회
     if kis.is_configured:
-        return kis.is_market_open(today)
-    return True  # KIS 미설정이면 평일=거래일로 간주
+        return kis.is_market_open(now, market="KR")
+    return True
 
 
-def _is_market_open_now() -> bool:
-    """현재 시각이 한국 정규장(09:00~15:30)인지 확인."""
-    if not _is_market_day():
-        return False
-    now = datetime.datetime.now(KST).time()
-    market_open = datetime.time(9, 0)
-    market_close = datetime.time(15, 30)
-    return market_open <= now <= market_close
+def _is_market_open_now(market: str = "KR") -> bool:
+    """시장 정규장 시간 여부 확인."""
+    return kis.is_market_open_now(market=market.upper())
 
 
 # ─── Helper: 보고서 생성 ──────────────────────────────────────
@@ -253,9 +278,15 @@ def _build_report_text(final_state: dict, ticker: str) -> str:
     return header + "\n\n".join(sections)
 
 
-def _extract_decision_summary(final_state: dict, decision: str, ticker: str) -> str:
+def _extract_decision_summary(
+    final_state: dict,
+    decision: str,
+    ticker: str,
+    market: str | None = None,
+) -> str:
     """Discord Embed에 넣을 요약 문자열 생성."""
-    lines = [f"**종목:** {ticker}", f"**최종 결정:** {decision}"]
+    market = (market or _market_of_ticker(ticker)).upper()
+    lines = [f"**시장:** {market}", f"**종목:** {ticker}", f"**최종 결정:** {decision}"]
     if final_state.get("investment_plan"):
         plan = final_state["investment_plan"]
         if len(plan) > 300:
@@ -264,73 +295,108 @@ def _extract_decision_summary(final_state: dict, decision: str, ticker: str) -> 
     return "\n".join(lines)
 
 
-async def _show_trade_button(channel: discord.abc.Messageable, ticker: str, decision: str):
+async def _show_trade_button(
+    channel: discord.abc.Messageable,
+    ticker: str,
+    decision: str,
+    market: str | None = None,
+):
     """개별 분석 결과에 따라 BUY/SELL 확인 버튼을 표시한다."""
     if not kis.is_configured:
         return
 
+    market = (market or _market_of_ticker(ticker)).upper()
+    currency = _currency_of_market(market)
+    if market == "US" and not kis.enable_us_trading:
+        await channel.send(
+            "ℹ️ 미국 자동주문은 비활성화되어 있습니다. `.env`의 "
+            "`ENABLE_US_TRADING=true` 설정 후 사용하세요."
+        )
+        return
     mode_label = "🧪 모의투자" if kis.virtual else "💰 실전투자"
     loop = asyncio.get_running_loop()
 
     if decision.upper() == "BUY":
-        if not _is_market_open_now():
-            _log("INFO", "MANUAL_BUY_BLOCKED", f"장외/휴장으로 BUY 버튼 미표시 ticker={ticker}")
+        if not _is_market_open_now(market):
+            _log("INFO", "MANUAL_BUY_BLOCKED", f"market={market} ticker={ticker}")
             await channel.send(
-                f"ℹ️ `{ticker}` BUY 신호이지만 현재 장외/휴장이라 수동 매수 버튼을 표시하지 않습니다."
+                f"ℹ️ `{ticker}`({market}) BUY 신호이지만 현재 장외/휴장이라 "
+                "수동 매수 버튼을 표시하지 않습니다."
             )
             return
         try:
-            price = await loop.run_in_executor(None, kis.get_price, ticker)
+            price = await loop.run_in_executor(None, kis.get_price, ticker, market)
             if price <= 0:
                 return
-            budget = kis.max_order_amount
-            qty = budget // price
+            budget = kis.us_max_order_amount if market == "US" else kis.max_order_amount
+            qty = int(budget // price)
             if qty <= 0:
                 await channel.send(
-                    f"⚠️ {ticker} — 예산({format_krw(budget)}) 대비 현재가({price:,}원)가 높아 매수 불가"
+                    f"⚠️ {ticker} — 예산({_format_money(budget, currency)}) 대비 "
+                    f"현재가({_format_money(price, currency)})가 높아 매수 불가"
                 )
                 return
-            view = BuyConfirmView(ticker=ticker, name=ticker, qty=qty, price=price)
+            view = BuyConfirmView(
+                ticker=ticker,
+                name=ticker,
+                qty=qty,
+                price=price,
+                market=market,
+                currency=currency,
+            )
             embed = discord.Embed(
                 title=f"🛒 {ticker} 매수 확인",
                 description=(
+                    f"**시장:** {market}\n"
                     f"**종목:** `{ticker}`\n"
-                    f"**현재가:** {price:,}원\n"
+                    f"**현재가:** {_format_money(price, currency)}\n"
                     f"**매수 수량:** {qty}주\n"
-                    f"**예상 금액:** {format_krw(qty * price)}\n\n"
+                    f"**예상 금액:** {_format_money(qty * price, currency)}\n\n"
                     f"매수하시겠습니까?"
                 ),
                 color=0x00FF00,
             )
-            embed.set_footer(text=mode_label)
+            embed.set_footer(text=f"{mode_label} | {currency}")
             await channel.send(embed=embed, view=view)
         except Exception:
             pass
 
     elif decision.upper() == "SELL":
         try:
-            balance_data = await loop.run_in_executor(None, kis.get_balance)
+            balance_data = await loop.run_in_executor(None, kis.get_balance, market)
             holding = next(
-                (h for h in balance_data["holdings"] if h["ticker"] == ticker), None
+                (
+                    h for h in balance_data["holdings"]
+                    if h["ticker"] == ticker and h.get("market", market) == market
+                ),
+                None,
             )
             if not holding or holding["qty"] <= 0:
                 return
             view = SellConfirmView(
-                ticker=ticker, name=holding["name"],
-                qty=holding["qty"], avg_price=holding["avg_price"],
+                ticker=ticker,
+                name=holding["name"],
+                qty=holding["qty"],
+                avg_price=holding["avg_price"],
+                market=market,
+                currency=currency,
+                exchange=holding.get("exchange", ""),
             )
             embed = discord.Embed(
                 title=f"🔴 {holding['name']} 매도 확인",
                 description=(
+                    f"**시장:** {market}\n"
                     f"**종목:** {holding['name']} (`{ticker}`)\n"
-                    f"**보유:** {holding['qty']}주 (평균 {holding['avg_price']:,}원)\n"
-                    f"**현재가:** {holding['current_price']:,}원\n"
-                    f"**손익:** {holding['pnl']:+,}원 ({holding['pnl_rate']:+.2f}%)\n\n"
+                    f"**보유:** {holding['qty']}주 "
+                    f"(평균 {_format_money(holding['avg_price'], currency)})\n"
+                    f"**현재가:** {_format_money(holding['current_price'], currency)}\n"
+                    f"**손익:** {_format_money(holding['pnl'], currency)} "
+                    f"({holding['pnl_rate']:+.2f}%)\n\n"
                     f"AI가 SELL을 권고합니다. 전량 매도하시겠습니까?"
                 ),
                 color=0xFF0000,
             )
-            embed.set_footer(text=mode_label)
+            embed.set_footer(text=f"{mode_label} | {currency}")
             await channel.send(embed=embed, view=view)
         except Exception:
             pass
@@ -447,6 +513,123 @@ async def _compute_stock_scores(count: int = 10) -> list[dict]:
     return scored[:count]
 
 
+def _compute_us_scores_from_yfinance(watchlist: list[str], count: int = 10) -> list[dict]:
+    """yfinance 워치리스트 기반 미국 후보 점수 계산."""
+    scored: list[dict] = []
+    for ticker in watchlist:
+        try:
+            hist = yf.Ticker(ticker).history(period="7d", interval="1d")
+            if hist.empty or "Close" not in hist.columns:
+                continue
+            closes = hist["Close"].dropna()
+            vols = hist["Volume"].dropna() if "Volume" in hist.columns else None
+            if len(closes) < 2:
+                continue
+
+            price = float(closes.iloc[-1])
+            prev = float(closes.iloc[-2])
+            if prev <= 0:
+                continue
+
+            pct = (price - prev) / prev * 100
+            vol = int(vols.iloc[-1]) if vols is not None and len(vols) > 0 else 0
+
+            score = 0
+            signals: list[str] = []
+            if 0 < pct <= 5:
+                score += 25
+                signals.append(f"등락률 +{pct:.2f}%")
+            elif pct > 5:
+                score += 10
+                signals.append(f"등락률 +{pct:.2f}% (과열주의)")
+            elif pct < -3:
+                continue
+
+            if vol >= 5_000_000:
+                score += 20
+                signals.append(f"거래량 {vol:,}")
+            elif vol >= 1_000_000:
+                score += 10
+                signals.append(f"거래량 {vol:,}")
+
+            if score <= 0:
+                continue
+
+            scored.append(
+                {
+                    "market": "US",
+                    "currency": "USD",
+                    "exchange": kis._us_exchange_cache.get(ticker, ""),
+                    "ticker": ticker,
+                    "name": ticker,
+                    "price": price,
+                    "prdy_ctrt": pct,
+                    "score": score,
+                    "signals": signals,
+                }
+            )
+        except Exception:
+            continue
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:count]
+
+
+async def _compute_us_stock_scores(count: int = 10) -> list[dict]:
+    """미국 후보 스코어링 (KIS 해외 랭킹 우선, yfinance 폴백)."""
+    loop = asyncio.get_running_loop()
+
+    # 1) KIS 해외 랭킹 우선
+    kis_candidates = await loop.run_in_executor(None, kis.get_us_volume_rank, max(30, count * 2))
+    if kis_candidates:
+        scored: list[dict] = []
+        for item in kis_candidates:
+            pct = float(item.get("prdy_ctrt", 0))
+            vol = int(item.get("acml_vol", 0))
+            score = 0
+            signals: list[str] = []
+
+            if 0 < pct <= 5:
+                score += 25
+                signals.append(f"등락률 +{pct:.2f}%")
+            elif pct > 5:
+                score += 10
+                signals.append(f"등락률 +{pct:.2f}% (과열주의)")
+            elif pct < -3:
+                continue
+
+            if vol >= 5_000_000:
+                score += 20
+                signals.append(f"거래량 {vol:,}")
+            elif vol >= 1_000_000:
+                score += 10
+                signals.append(f"거래량 {vol:,}")
+
+            if score <= 0:
+                continue
+
+            scored.append(
+                {
+                    "market": "US",
+                    "currency": "USD",
+                    "exchange": item.get("exchange", ""),
+                    "ticker": item["ticker"],
+                    "name": item.get("name", item["ticker"]),
+                    "price": float(item.get("price", 0)),
+                    "prdy_ctrt": pct,
+                    "score": score,
+                    "signals": signals,
+                }
+            )
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        if scored:
+            return scored[:count]
+
+    # 2) yfinance fallback
+    return await loop.run_in_executor(None, _compute_us_scores_from_yfinance, kis.us_watchlist, count)
+
+
 # ─── Helper: TOP5 분석 실행 ───────────────────────────────────
 async def _run_top5_analysis(channel: discord.abc.Messageable, trade_date: str):
     """대형주 TOP5를 조회하고 각각 AI 분석 실행."""
@@ -529,7 +712,7 @@ async def _run_top5_analysis(channel: discord.abc.Messageable, trade_date: str):
     if sell_targets and kis.is_configured:
         try:
             loop = asyncio.get_running_loop()
-            balance_data = await loop.run_in_executor(None, kis.get_balance)
+            balance_data = await loop.run_in_executor(None, kis.get_balance, "KR")
             holdings_map = {h["ticker"]: h for h in balance_data["holdings"]}
         except Exception:
             holdings_map = {}
@@ -542,14 +725,17 @@ async def _run_top5_analysis(channel: discord.abc.Messageable, trade_date: str):
                     name=target["name"],
                     qty=holding["qty"],
                     avg_price=holding["avg_price"],
+                    market="KR",
+                    currency="KRW",
+                    exchange=holding.get("exchange", "KRX"),
                 )
                 embed = discord.Embed(
                     title=f"🔴 {target['name']} 매도 확인",
                     description=(
                         f"**종목:** {target['name']} (`{target['ticker']}`)\n"
-                        f"**보유:** {holding['qty']}주 (평균 {holding['avg_price']:,}원)\n"
-                        f"**현재가:** {holding['current_price']:,}원\n"
-                        f"**손익:** {holding['pnl']:+,}원 ({holding['pnl_rate']:+.2f}%)\n\n"
+                        f"**보유:** {holding['qty']}주 (평균 {_format_money(holding['avg_price'], 'KRW')})\n"
+                        f"**현재가:** {_format_money(holding['current_price'], 'KRW')}\n"
+                        f"**손익:** {_format_money(holding['pnl'], 'KRW')} ({holding['pnl_rate']:+.2f}%)\n\n"
                         f"AI가 SELL을 권고합니다. 전량 매도하시겠습니까?"
                     ),
                     color=0xFF0000,
@@ -573,7 +759,7 @@ async def _run_top5_analysis(channel: discord.abc.Messageable, trade_date: str):
         )
         return
 
-    if not _is_market_open_now():
+    if not _is_market_open_now("KR"):
         buy_list = ", ".join(f"{t['name']}({t['ticker']})" for t in buy_targets)
         await channel.send(
             "ℹ️ **장외/휴장 상태**라 `/대형주` 수동 매수 버튼을 비활성화했습니다.\n"
@@ -582,30 +768,35 @@ async def _run_top5_analysis(channel: discord.abc.Messageable, trade_date: str):
         _log("INFO", "TOP5_BUY_BUTTON_BLOCKED", "market closed")
         return
 
-    per_stock_budget = kis.max_order_amount // len(buy_targets)
+    per_stock_budget = int(kis.max_order_amount // len(buy_targets))
     await channel.send(
         f"🧪 **테스트 모드 예산(수동 /대형주)**\n"
-        f"총 상한: {format_krw(kis.max_order_amount)} | 종목당: {format_krw(per_stock_budget)}"
+            f"총 상한: {_format_money(kis.max_order_amount, 'KRW')} | "
+            f"종목당: {_format_money(per_stock_budget, 'KRW')}"
     )
     for target in buy_targets:
-        qty = per_stock_budget // target["price"] if target["price"] > 0 else 0
+        qty = int(per_stock_budget // target["price"]) if target["price"] > 0 else 0
         if qty <= 0:
             await channel.send(
-                f"⚠️ {target['name']} — 예산({format_krw(per_stock_budget)}) 부족으로 매수 불가"
+                f"⚠️ {target['name']} — 예산({_format_money(per_stock_budget, 'KRW')}) 부족으로 매수 불가"
             )
             continue
         view = BuyConfirmView(
-            ticker=target["ticker"], name=target["name"],
-            qty=qty, price=target["price"],
+            ticker=target["ticker"],
+            name=target["name"],
+            qty=qty,
+            price=target["price"],
+            market="KR",
+            currency="KRW",
         )
         embed = discord.Embed(
             title=f"🛒 {target['name']} 매수 확인",
             description=(
                 f"**종목:** {target['name']} (`{target['ticker']}`)\n"
-                f"**현재가:** {target['price']:,}원\n"
+                f"**현재가:** {_format_money(target['price'], 'KRW')}\n"
                 f"**매수 수량:** {qty}주\n"
-                f"**예산 규칙:** 수동 /대형주 테스트 상한({format_krw(per_stock_budget)})\n"
-                f"**예상 금액:** {format_krw(qty * target['price'])}\n\n"
+                f"**예산 규칙:** 수동 /대형주 테스트 상한({_format_money(per_stock_budget, 'KRW')})\n"
+                f"**예상 금액:** {_format_money(qty * target['price'], 'KRW')}\n\n"
                 f"매수하시겠습니까?"
             ),
             color=0x00FF00,
@@ -618,12 +809,22 @@ async def _run_top5_analysis(channel: discord.abc.Messageable, trade_date: str):
 class BuyConfirmView(discord.ui.View):
     """매수 확인/건너뛰기 버튼"""
 
-    def __init__(self, ticker: str, name: str, qty: int, price: int):
+    def __init__(
+        self,
+        ticker: str,
+        name: str,
+        qty: int,
+        price: float,
+        market: str = "KR",
+        currency: str = "KRW",
+    ):
         super().__init__(timeout=300)
         self.ticker = ticker
         self.name = name
         self.qty = qty
-        self.price = price
+        self.price = float(price)
+        self.market = market.upper()
+        self.currency = currency.upper()
 
     @discord.ui.button(label="✅ 매수 확인", style=discord.ButtonStyle.green)
     async def confirm_buy(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -631,7 +832,7 @@ class BuyConfirmView(discord.ui.View):
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
-                None, kis.buy_stock, self.ticker, self.qty
+                None, kis.buy_stock, self.ticker, self.qty, 0, self.market
             )
             if result["success"]:
                 record_trade(
@@ -639,12 +840,16 @@ class BuyConfirmView(discord.ui.View):
                     self.qty, self.price,
                     order_no=result.get("order_no", ""),
                     reason="AI BUY 신호",
+                    market=self.market,
+                    currency=self.currency,
                 )
                 embed = discord.Embed(
                     title=f"✅ {self.name} 매수 완료",
                     description=(
+                        f"**시장:** {self.market}\n"
                         f"**주문번호:** {result['order_no']}\n"
                         f"**수량:** {self.qty}주\n"
+                        f"**평균 단가:** {_format_money(self.price, self.currency)}\n"
                         f"**메시지:** {result['message']}"
                     ),
                     color=0x00FF00,
@@ -671,12 +876,24 @@ class BuyConfirmView(discord.ui.View):
 class SellConfirmView(discord.ui.View):
     """매도 확인/취소 버튼"""
 
-    def __init__(self, ticker: str, name: str, qty: int, avg_price: int = 0):
+    def __init__(
+        self,
+        ticker: str,
+        name: str,
+        qty: int,
+        avg_price: float = 0,
+        market: str = "KR",
+        currency: str = "KRW",
+        exchange: str = "",
+    ):
         super().__init__(timeout=120)
         self.ticker = ticker
         self.name = name
         self.qty = qty
-        self.avg_price = avg_price  # 평균 매수가 (실현손익 계산용)
+        self.avg_price = float(avg_price)  # 평균 매수가 (실현손익 계산용)
+        self.market = market.upper()
+        self.currency = currency.upper()
+        self.exchange = exchange
 
     @discord.ui.button(label="🔴 매도 확인", style=discord.ButtonStyle.danger)
     async def confirm_sell(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -684,12 +901,12 @@ class SellConfirmView(discord.ui.View):
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
-                None, kis.sell_stock, self.ticker, self.qty
+                None, kis.sell_stock, self.ticker, self.qty, 0, self.market
             )
             if result["success"]:
                 # 현재가 조회하여 실현손익 기록
                 try:
-                    sell_price = await loop.run_in_executor(None, kis.get_price, self.ticker)
+                    sell_price = await loop.run_in_executor(None, kis.get_price, self.ticker, self.market)
                 except Exception:
                     sell_price = 0
                 record_trade(
@@ -697,14 +914,26 @@ class SellConfirmView(discord.ui.View):
                     self.qty, sell_price,
                     order_no=result.get("order_no", ""),
                     reason="매도",
+                    market=self.market,
+                    currency=self.currency,
                 )
                 if self.avg_price > 0 and sell_price > 0:
-                    record_pnl(self.ticker, self.name, self.avg_price, sell_price, self.qty)
+                    record_pnl(
+                        self.ticker,
+                        self.name,
+                        self.avg_price,
+                        sell_price,
+                        self.qty,
+                        market=self.market,
+                        currency=self.currency,
+                    )
                 embed = discord.Embed(
                     title=f"✅ {self.name} 매도 완료",
                     description=(
+                        f"**시장:** {self.market}\n"
                         f"**종목:** `{self.ticker}`\n"
                         f"**수량:** {self.qty}주\n"
+                        f"**체결 단가:** {_format_money(sell_price, self.currency)}\n"
                         f"**주문번호:** {result['order_no']}\n"
                         f"**메시지:** {result['message']}"
                     ),
@@ -738,6 +967,7 @@ async def analyze(
     date: str | None = None,
 ):
     ticker = ticker.upper().strip()
+    market = _market_of_ticker(ticker)
     try:
         trade_date = _parse_trade_date(date)
     except ValueError as e:
@@ -745,7 +975,11 @@ async def analyze(
         return
 
     await interaction.response.defer(thinking=True)
-    _log("INFO", "SLASH_ANALYZE_START", f"{_interaction_actor(interaction)} ticker={ticker} date={trade_date}")
+    _log(
+        "INFO",
+        "SLASH_ANALYZE_START",
+        f"{_interaction_actor(interaction)} market={market} ticker={ticker} date={trade_date}",
+    )
 
     if not _is_allowed_channel(interaction.channel_id):
         _log("WARN", "SLASH_ANALYZE_BLOCKED", f"허용되지 않은 채널 channel={interaction.channel_id}")
@@ -769,7 +1003,7 @@ async def analyze(
 
     async with _analysis_lock:
         status_msg = await interaction.followup.send(
-            f"🔍 **{ticker}** 분석을 시작합니다… (약 2~5분 소요)\n"
+            f"🔍 **{ticker} ({market})** 분석을 시작합니다… (약 2~5분 소요)\n"
             f"📅 기준일: {trade_date}",
             wait=True,
         )
@@ -782,11 +1016,11 @@ async def analyze(
             )
 
             report_text = _build_report_text(final_state, ticker)
-            summary = _extract_decision_summary(final_state, decision, ticker)
+            summary = _extract_decision_summary(final_state, decision, ticker, market)
 
             color_map = {"BUY": 0x00FF00, "SELL": 0xFF0000, "HOLD": 0xFFAA00}
             embed = discord.Embed(
-                title=f"📋 {ticker} 분석 완료",
+                title=f"📋 {ticker} ({market}) 분석 완료",
                 description=summary,
                 color=color_map.get(decision.upper(), 0x808080),
                 timestamp=datetime.datetime.now(),
@@ -797,19 +1031,23 @@ async def analyze(
 
             report_file = discord.File(
                 fp=BytesIO(report_text.encode("utf-8")),
-                filename=f"{ticker}_{trade_date}_report.md",
+                filename=f"{market}_{ticker}_{trade_date}_report.md",
             )
             await interaction.followup.send(
-                f"📄 **{ticker}** 전체 보고서:",
+                f"📄 **{ticker} ({market})** 전체 보고서:",
                 file=report_file,
             )
 
             # BUY/SELL 판정 시 자동매매 버튼
             ch = interaction.channel
             if isinstance(ch, discord.abc.Messageable):
-                await _show_trade_button(ch, ticker, decision)
+                await _show_trade_button(ch, ticker, decision, market=market)
 
-            _log("INFO", "SLASH_ANALYZE_DONE", f"ticker={ticker} decision={decision}")
+            _log(
+                "INFO",
+                "SLASH_ANALYZE_DONE",
+                f"market={market} ticker={ticker} decision={decision}",
+            )
 
         except Exception as e:
             _log("ERROR", "SLASH_ANALYZE_ERROR", f"ticker={ticker} error={str(e)[:200]}")
@@ -865,7 +1103,7 @@ async def balance_cmd(interaction: discord.Interaction):
 
     try:
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, kis.get_balance)
+        data = await loop.run_in_executor(None, kis.get_balance, "ALL")
         holdings = data["holdings"]
         summary = data["summary"]
 
@@ -875,10 +1113,12 @@ async def balance_cmd(interaction: discord.Interaction):
             lines = []
             for h in holdings:
                 pnl_emoji = "🟢" if h["pnl"] >= 0 else "🔴"
+                currency = h.get("currency", _currency_of_market(h.get("market", "KR")))
                 lines.append(
-                    f"**{h['name']}** (`{h['ticker']}`) — {h['qty']}주\n"
-                    f"  평균가 {h['avg_price']:,} → 현재 {h['current_price']:,}원 "
-                    f"{pnl_emoji} {h['pnl']:+,}원 ({h['pnl_rate']:+.2f}%)"
+                    f"**[{h.get('market', 'KR')}] {h['name']}** (`{h['ticker']}`) — {h['qty']}주\n"
+                    f"  평균가 {_format_money(h['avg_price'], currency)} → "
+                    f"현재 {_format_money(h['current_price'], currency)} "
+                    f"{pnl_emoji} {_format_money(h['pnl'], currency)} ({h['pnl_rate']:+.2f}%)"
                 )
             desc = "\n".join(lines)
 
@@ -890,12 +1130,35 @@ async def balance_cmd(interaction: discord.Interaction):
             timestamp=datetime.datetime.now(),
         )
         if summary:
-            embed.add_field(name="총 평가액", value=f"{summary.get('total_eval', 0):,}원", inline=True)
-            embed.add_field(name="총 손익", value=f"{summary.get('total_pnl', 0):+,}원", inline=True)
-            embed.add_field(name="예수금", value=f"{summary.get('cash', 0):,}원", inline=True)
+            krw = summary.get("KRW", {})
+            usd = summary.get("USD", {})
+            embed.add_field(
+                name="KRW 요약",
+                value=(
+                    f"평가액: {_format_money(krw.get('total_eval', 0), 'KRW')}\n"
+                    f"손익: {_format_money(krw.get('total_pnl', 0), 'KRW')}\n"
+                    f"예수금: {_format_money(krw.get('cash', 0), 'KRW')}"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="USD 요약",
+                value=(
+                    f"평가액: {_format_money(usd.get('total_eval', 0), 'USD')}\n"
+                    f"손익: {_format_money(usd.get('total_pnl', 0), 'USD')}\n"
+                    f"예수금: {_format_money(usd.get('cash', 0), 'USD')}"
+                ),
+                inline=True,
+            )
+            embed.add_field(name="보유 종목 수", value=f"{len(holdings)}개", inline=True)
 
         await interaction.followup.send(embed=embed)
-        _log("INFO", "SLASH_BALANCE_DONE", f"holdings={len(holdings)} total_eval={summary.get('total_eval', 0)}")
+        _log(
+            "INFO",
+            "SLASH_BALANCE_DONE",
+            f"holdings={len(holdings)} krw_eval={summary.get('KRW', {}).get('total_eval', 0)} "
+            f"usd_eval={summary.get('USD', {}).get('total_eval', 0)}",
+        )
     except Exception as e:
         _log("ERROR", "SLASH_BALANCE_ERROR", str(e)[:200])
         await interaction.followup.send(f"❌ 잔고 조회 실패: {str(e)[:500]}")
@@ -925,7 +1188,9 @@ async def sell_cmd(
         await interaction.followup.send("⚠️ KIS API가 설정되지 않았습니다.")
         return
 
-    ticker = ticker.strip()
+    ticker = ticker.strip().upper()
+    market = _market_of_ticker(ticker)
+    normalized = kis.normalize_ticker(ticker, market)
     holding: dict | None = None
     loop = asyncio.get_running_loop()
 
@@ -936,9 +1201,14 @@ async def sell_cmd(
 
     # 잔고에서 보유 정보 조회
     try:
-        balance_data = await loop.run_in_executor(None, kis.get_balance)
+        balance_data = await loop.run_in_executor(None, kis.get_balance, "ALL")
         holding = next(
-            (h for h in balance_data["holdings"] if h["ticker"] == ticker), None
+            (
+                h
+                for h in balance_data["holdings"]
+                if h["ticker"] == normalized and h.get("market", market) == market
+            ),
+            None,
         )
     except Exception as e:
         _log("ERROR", "SLASH_SELL_BALANCE_ERROR", str(e)[:200])
@@ -946,27 +1216,41 @@ async def sell_cmd(
         return
 
     if not holding:
-        _log("WARN", "SLASH_SELL_NO_HOLDING", f"ticker={ticker}")
-        await interaction.followup.send(f"⚠️ `{ticker}` 보유 내역이 없습니다.")
+        _log("WARN", "SLASH_SELL_NO_HOLDING", f"market={market} ticker={normalized}")
+        await interaction.followup.send(f"⚠️ `{normalized}`({market}) 보유 내역이 없습니다.")
         return
 
     sell_qty = qty if qty is not None else holding["qty"]
     stock_name = holding["name"]
     avg_price = holding["avg_price"]
+    currency = holding.get("currency", _currency_of_market(market))
 
-    view = SellConfirmView(ticker=ticker, name=stock_name, qty=sell_qty, avg_price=avg_price)
+    view = SellConfirmView(
+        ticker=holding["ticker"],
+        name=stock_name,
+        qty=sell_qty,
+        avg_price=avg_price,
+        market=market,
+        currency=currency,
+        exchange=holding.get("exchange", ""),
+    )
     mode_label = "🧪 모의투자" if kis.virtual else "💰 실전투자"
     embed = discord.Embed(
         title="🔴 매도 확인",
         description=(
-            f"**종목:** {stock_name} (`{ticker}`)\n"
+            f"**시장:** {market}\n"
+            f"**종목:** {stock_name} (`{holding['ticker']}`)\n"
             f"**수량:** {sell_qty}주\n\n매도하시겠습니까?"
         ),
         color=0xFF0000,
     )
-    embed.set_footer(text=mode_label)
+    embed.set_footer(text=f"{mode_label} | {currency}")
     await interaction.followup.send(embed=embed, view=view)
-    _log("INFO", "SLASH_SELL_PROMPT", f"ticker={ticker} qty={sell_qty} avg_price={avg_price}")
+    _log(
+        "INFO",
+        "SLASH_SELL_PROMPT",
+        f"market={market} ticker={holding['ticker']} qty={sell_qty} avg_price={avg_price}",
+    )
 
 
 # ─── Slash Command: /상태 ──────────────────────────────────────
@@ -988,7 +1272,12 @@ async def status_cmd(interaction: discord.Interaction):
 
     lines = []
     for s in states:
-        emoji = {"morning_buy": "🌅", "afternoon_sell": "🌇"}.get(
+        emoji = {
+            "morning_buy": "🌅",
+            "afternoon_sell": "🌇",
+            "us_morning_buy": "🇺🇸🌅",
+            "us_afternoon_sell": "🇺🇸🌇",
+        }.get(
             s["action"], "🔔"
         )
         lines.append(
@@ -1018,6 +1307,7 @@ async def bot_info_cmd(interaction: discord.Interaction):
         return
 
     now = datetime.datetime.now(KST)
+    now_ny = datetime.datetime.now(NY_TZ)
     mode_label = "🧪 모의투자" if kis.virtual else "💰 실전투자"
 
     # 다음 실행 시각 계산
@@ -1038,44 +1328,91 @@ async def bot_info_cmd(interaction: discord.Interaction):
     buy_h_r, buy_m_r = divmod(int(buy_remaining.total_seconds()) // 60, 60)
     sell_h_r, sell_m_r = divmod(int(sell_remaining.total_seconds()) // 60, 60)
 
+    us_buy_h_r, us_buy_m_r = 0, 0
+    us_sell_h_r, us_sell_m_r = 0, 0
+    if ENABLE_US_TRADING:
+        us_today = now_ny.date()
+        us_buy_time = datetime.datetime.combine(
+            us_today, datetime.time(_us_buy_h, _us_buy_m), tzinfo=NY_TZ
+        )
+        us_sell_time = datetime.datetime.combine(
+            us_today, datetime.time(_us_sell_h, _us_sell_m), tzinfo=NY_TZ
+        )
+        if us_buy_time <= now_ny:
+            us_buy_time += datetime.timedelta(days=1)
+        if us_sell_time <= now_ny:
+            us_sell_time += datetime.timedelta(days=1)
+        us_buy_remaining = us_buy_time - now_ny
+        us_sell_remaining = us_sell_time - now_ny
+        us_buy_h_r, us_buy_m_r = divmod(int(us_buy_remaining.total_seconds()) // 60, 60)
+        us_sell_h_r, us_sell_m_r = divmod(int(us_sell_remaining.total_seconds()) // 60, 60)
+
     # 오늘 상태
     states = get_daily_state()
     morning_done = any(s["action"] == "morning_buy" for s in states)
     afternoon_done = any(s["action"] == "afternoon_sell" for s in states)
-    market_open = _is_market_day()
+    us_morning_done = any(s["action"] == "us_morning_buy" for s in states)
+    us_afternoon_done = any(s["action"] == "us_afternoon_sell" for s in states)
+    kr_market_open = _is_market_day("KR")
+    us_market_open = _is_market_day("US")
 
     status_lines = [
-        f"**📅 오늘:** {today} ({'거래일 ✅' if market_open else '휴장일 ❌'})",
+        f"**📅 KR 오늘:** {today} ({'거래일 ✅' if kr_market_open else '휴장일 ❌'})",
+        f"**📅 US 오늘:** {now_ny.date()} ({'거래일 ✅' if us_market_open else '휴장일 ❌'})",
         f"**⏰ 현재 시각:** {now.strftime('%H:%M:%S')} KST",
+        f"**⏰ NY 시각:** {now_ny.strftime('%H:%M:%S')} ET",
         "",
-        "── **자동매매 스케줄** ──",
+        "── **KR 자동매매 스케줄** ──",
         f"🌅 **아침 매수:** {AUTO_BUY_TIME} KST → "
         f"{'✅ 완료' if morning_done else f'⏳ {buy_h_r}시간 {buy_m_r}분 후'}",
         f"🌇 **오후 매도:** {AUTO_SELL_TIME} KST → "
         f"{'✅ 완료' if afternoon_done else f'⏳ {sell_h_r}시간 {sell_m_r}분 후'}",
-        f"🔔 **손절/익절:** {MONITOR_INTERVAL_MIN}분 간격 감시 중",
-        "",
-        "── **설정** ──",
-        f"📊 **매수 종목 수:** {DAY_TRADE_PICKS}개",
-        f"🧪 **수동(/대형주) 예산:** 총 {format_krw(kis.max_order_amount)} 상한 분배",
-        "🤖 **자동(09:30) 예산:** 예수금 전액 균등분배",
-        f"🔴 **손절 라인:** {STOP_LOSS_PCT}%",
-        f"🟢 **익절 라인:** {TAKE_PROFIT_PCT}%",
-        f"🏦 **매매 모드:** {mode_label}",
-        f"🤖 **분석 모델:** {config.get('deep_think_llm', 'N/A')}",
     ]
+    if ENABLE_US_TRADING:
+        status_lines.extend(
+            [
+                "",
+                "── **US 자동매매 스케줄** ──",
+                f"🌅 **아침 매수:** {US_AUTO_BUY_TIME} ET → "
+                f"{'✅ 완료' if us_morning_done else f'⏳ {us_buy_h_r}시간 {us_buy_m_r}분 후'}",
+                f"🌇 **오후 매도:** {US_AUTO_SELL_TIME} ET → "
+                f"{'✅ 완료' if us_afternoon_done else f'⏳ {us_sell_h_r}시간 {us_sell_m_r}분 후'}",
+            ]
+        )
+    status_lines.extend(
+        [
+            "",
+            f"🔔 **손절/익절:** {MONITOR_INTERVAL_MIN}분 간격 감시 중",
+            "",
+            "── **설정** ──",
+            f"📊 **KR 매수 종목 수:** {DAY_TRADE_PICKS}개",
+            f"📊 **US 매수 종목 수:** {US_DAY_TRADE_PICKS}개",
+            f"🧪 **KR 수동 예산:** {_format_money(kis.max_order_amount, 'KRW')}",
+            f"🧪 **US 수동 예산:** {_format_money(kis.us_max_order_amount, 'USD')}",
+            f"🔴 **손절 라인:** {STOP_LOSS_PCT}%",
+            f"🟢 **익절 라인:** {TAKE_PROFIT_PCT}%",
+            f"🏦 **매매 모드:** {mode_label}",
+            f"🤖 **분석 모델:** {config.get('deep_think_llm', 'N/A')}",
+        ]
+    )
 
     if kis.is_configured:
         try:
             loop = asyncio.get_running_loop()
-            bal = await loop.run_in_executor(None, kis.get_balance)
+            bal = await loop.run_in_executor(None, kis.get_balance, "ALL")
             sm = bal.get("summary", {})
             holdings_count = len(bal.get("holdings", []))
             status_lines.append("")
             status_lines.append("── **계좌** ──")
-            status_lines.append(f"💵 **예수금:** {sm.get('cash', 0):,}원")
+            status_lines.append(f"💵 **KR 예수금:** {_format_money(sm.get('KRW', {}).get('cash', 0), 'KRW')}")
+            status_lines.append(f"💵 **US 예수금:** {_format_money(sm.get('USD', {}).get('cash', 0), 'USD')}")
             status_lines.append(f"📦 **보유종목:** {holdings_count}개")
-            status_lines.append(f"📈 **총 평가액:** {sm.get('total_eval', 0):,}원")
+            status_lines.append(
+                f"📈 **KR 평가액:** {_format_money(sm.get('KRW', {}).get('total_eval', 0), 'KRW')}"
+            )
+            status_lines.append(
+                f"📈 **US 평가액:** {_format_money(sm.get('USD', {}).get('total_eval', 0), 'USD')}"
+            )
         except Exception:
             pass
 
@@ -1083,7 +1420,12 @@ async def bot_info_cmd(interaction: discord.Interaction):
         status_lines.append("")
         status_lines.append("── **오늘 실행 이력** ──")
         for s in states:
-            emoji = {"morning_buy": "🌅", "afternoon_sell": "🌇"}.get(
+            emoji = {
+                "morning_buy": "🌅",
+                "afternoon_sell": "🌇",
+                "us_morning_buy": "🇺🇸🌅",
+                "us_afternoon_sell": "🇺🇸🌇",
+            }.get(
                 s["action"], "🔔"
             )
             status_lines.append(
@@ -1098,7 +1440,11 @@ async def bot_info_cmd(interaction: discord.Interaction):
     )
     embed.set_footer(text="TradingAgents 데이 트레이딩 시스템")
     await interaction.followup.send(embed=embed)
-    _log("INFO", "SLASH_BOTINFO_DONE", f"market_open={market_open} state_count={len(states)}")
+    _log(
+        "INFO",
+        "SLASH_BOTINFO_DONE",
+        f"kr_open={kr_market_open} us_open={us_market_open} state_count={len(states)}",
+    )
 
 
 # ─── Slash Command: /수익 ──────────────────────────────────────
@@ -1112,62 +1458,75 @@ async def pnl_cmd(interaction: discord.Interaction):
         await interaction.followup.send("❌ 이 채널에서는 사용할 수 없습니다.")
         return
 
-    pnl_data = get_total_pnl()
-    ticker_data = get_ticker_summary()
-    recent = get_recent_pnl(10)
+    by_ccy = get_total_pnl_by_currency()
+    krw = by_ccy.get("KRW", get_total_pnl(currency="KRW"))
+    usd = by_ccy.get("USD", get_total_pnl(currency="USD"))
+    ticker_krw = get_ticker_summary(currency="KRW")
+    ticker_usd = get_ticker_summary(currency="USD")
+    recent_krw = get_recent_pnl(5, currency="KRW")
+    recent_usd = get_recent_pnl(5, currency="USD")
 
-    # 요약
-    pnl_emoji = "🟢" if pnl_data["total_pnl"] >= 0 else "🔴"
     desc_lines = [
-        f"{pnl_emoji} **누적 실현손익:** {pnl_data['total_pnl']:+,}원",
-        f"📈 **총 거래 횟수:** {pnl_data['trade_count']}회",
-        f"✅ **승률:** {pnl_data['win_rate']}% "
-        f"({pnl_data['win_count']}승 {pnl_data['loss_count']}패)",
+        f"KRW 손익: {_format_money(krw['total_pnl'], 'KRW')} | "
+        f"거래 {krw['trade_count']}회 | 승률 {krw['win_rate']}%",
+        f"USD 손익: {_format_money(usd['total_pnl'], 'USD')} | "
+        f"거래 {usd['trade_count']}회 | 승률 {usd['win_rate']}%",
     ]
 
+    tone_total = krw["total_pnl"] + usd["total_pnl"]
     embed = discord.Embed(
-        title="📊 매매 수익 현황",
+        title="📊 매매 수익 현황 (통화 분리)",
         description="\n".join(desc_lines),
-        color=0x00FF00 if pnl_data["total_pnl"] >= 0 else 0xFF0000,
+        color=0x00FF00 if tone_total >= 0 else 0xFF0000,
         timestamp=datetime.datetime.now(),
     )
 
-    # 종목별 요약
-    if ticker_data:
-        tk_lines = []
-        for t in ticker_data[:10]:
-            tk_emoji = "🟢" if t["total_pnl"] >= 0 else "🔴"
-            tk_lines.append(
-                f"{tk_emoji} **{t['name']}** (`{t['ticker']}`) "
-                f"— {t['count']}회 | {t['total_pnl']:+,}원 | 평균 {t['avg_pnl_rate']:+.1f}%"
+    if ticker_krw:
+        lines = []
+        for t in ticker_krw[:5]:
+            emoji = "🟢" if t["total_pnl"] >= 0 else "🔴"
+            lines.append(
+                f"{emoji} [{t['market']}] {t['name']} (`{t['ticker']}`) "
+                f"— {t['count']}회 | {_format_money(t['total_pnl'], 'KRW')} | 평균 {t['avg_pnl_rate']:+.1f}%"
             )
-        embed.add_field(
-            name="🏢 종목별 수익",
-            value="\n".join(tk_lines),
-            inline=False,
-        )
+        embed.add_field(name="🏢 KRW 종목별", value="\n".join(lines), inline=False)
 
-    # 최근 거래
-    if recent:
-        recent_lines = []
-        for r in recent[:5]:
-            r_emoji = "🟢" if r["pnl"] >= 0 else "🔴"
-            recent_lines.append(
-                f"{r_emoji} {r['name']} — {r['pnl']:+,}원 "
+    if ticker_usd:
+        lines = []
+        for t in ticker_usd[:5]:
+            emoji = "🟢" if t["total_pnl"] >= 0 else "🔴"
+            lines.append(
+                f"{emoji} [{t['market']}] {t['name']} (`{t['ticker']}`) "
+                f"— {t['count']}회 | {_format_money(t['total_pnl'], 'USD')} | 평균 {t['avg_pnl_rate']:+.1f}%"
+            )
+        embed.add_field(name="🌎 USD 종목별", value="\n".join(lines), inline=False)
+
+    if recent_krw:
+        lines = []
+        for r in recent_krw[:3]:
+            emoji = "🟢" if r["pnl"] >= 0 else "🔴"
+            lines.append(
+                f"{emoji} {r['name']} — {_format_money(r['pnl'], 'KRW')} "
                 f"({r['pnl_rate']:+.1f}%) | {r['created_at']}"
             )
-        embed.add_field(
-            name="🕗 최근 실현손익 (5건)",
-            value="\n".join(recent_lines),
-            inline=False,
-        )
+        embed.add_field(name="🕗 최근 KRW 손익", value="\n".join(lines), inline=False)
 
-    embed.set_footer(text="TradingAgents 매매 이력")
+    if recent_usd:
+        lines = []
+        for r in recent_usd[:3]:
+            emoji = "🟢" if r["pnl"] >= 0 else "🔴"
+            lines.append(
+                f"{emoji} {r['name']} — {_format_money(r['pnl'], 'USD')} "
+                f"({r['pnl_rate']:+.1f}%) | {r['created_at']}"
+            )
+        embed.add_field(name="🕗 최근 USD 손익", value="\n".join(lines), inline=False)
+
+    embed.set_footer(text="TradingAgents 매매 이력 (통화 분리)")
     await interaction.followup.send(embed=embed)
     _log(
         "INFO",
         "SLASH_PNL_DONE",
-        f"total_pnl={pnl_data['total_pnl']} trade_count={pnl_data['trade_count']} recent={len(recent)}",
+        f"krw_total={krw['total_pnl']} usd_total={usd['total_pnl']}",
     )
 
 
@@ -1185,7 +1544,7 @@ async def morning_auto_buy():
     if not ALLOWED_CHANNEL_IDS or not kis.is_configured:
         _log("INFO", "AUTO_BUY_SKIP", "채널 미설정 또는 KIS 미설정")
         return
-    if not _is_market_day():
+    if not _is_market_day("KR"):
         _log("INFO", "AUTO_BUY_SKIP", "오늘은 휴장일")
         return
     if _analysis_lock.locked():
@@ -1228,7 +1587,7 @@ async def morning_auto_buy():
 
         # 이미 보유 중인 종목 제외
         try:
-            balance_data = await loop.run_in_executor(None, kis.get_balance)
+            balance_data = await loop.run_in_executor(None, kis.get_balance, "KR")
             held_tickers = {h["ticker"] for h in balance_data.get("holdings", [])}
         except Exception:
             held_tickers = set()
@@ -1307,7 +1666,7 @@ async def morning_auto_buy():
 
         # ── 3) 통장 전액 균등분배 → 자동 매수 ──
         try:
-            balance_data = await loop.run_in_executor(None, kis.get_balance)
+            balance_data = await loop.run_in_executor(None, kis.get_balance, "KR")
             cash = balance_data.get("summary", {}).get("cash", 0)
         except Exception as e:
             _log("ERROR", "AUTO_BUY_BALANCE_ERROR", str(e)[:200])
@@ -1326,7 +1685,7 @@ async def morning_auto_buy():
         for target in buy_targets:
             # 매수 직전 현재가 재조회
             try:
-                current_price = await loop.run_in_executor(None, kis.get_price, target["ticker"])
+                current_price = await loop.run_in_executor(None, kis.get_price, target["ticker"], "KR")
             except Exception:
                 current_price = target["price"]
             if current_price <= 0:
@@ -1342,7 +1701,7 @@ async def morning_auto_buy():
 
             # 잔액 재확인
             try:
-                fresh_bal = await loop.run_in_executor(None, kis.get_balance)
+                fresh_bal = await loop.run_in_executor(None, kis.get_balance, "KR")
                 remaining_cash = fresh_bal.get("summary", {}).get("cash", 0)
             except Exception:
                 remaining_cash = cash
@@ -1355,7 +1714,7 @@ async def morning_auto_buy():
 
             try:
                 result = await loop.run_in_executor(
-                    None, kis.buy_stock, target["ticker"], qty
+                    None, kis.buy_stock, target["ticker"], qty, 0, "KR"
                 )
                 if result["success"]:
                     amount = qty * current_price
@@ -1365,6 +1724,8 @@ async def morning_auto_buy():
                         qty, current_price,
                         order_no=result.get("order_no", ""),
                         reason=f"데이트레이딩 자동매수 (score={target['score']})",
+                        market="KR",
+                        currency="KRW",
                     )
                     buy_results.append(
                         f"✅ {target['name']} ({target['ticker']}) — "
@@ -1413,7 +1774,7 @@ async def afternoon_auto_sell():
     if not ALLOWED_CHANNEL_IDS or not kis.is_configured:
         _log("INFO", "AUTO_SELL_SKIP", "채널 미설정 또는 KIS 미설정")
         return
-    if not _is_market_day():
+    if not _is_market_day("KR"):
         _log("INFO", "AUTO_SELL_SKIP", "오늘은 휴장일")
         return
     # 재시작 중복 방지: 오늘 이미 매도 완료했으면 스킵
@@ -1437,7 +1798,7 @@ async def afternoon_auto_sell():
 
     # 보유종목 확인
     try:
-        balance_data = await loop.run_in_executor(None, kis.get_balance)
+        balance_data = await loop.run_in_executor(None, kis.get_balance, "KR")
         holdings = balance_data.get("holdings", [])
     except Exception as e:
         _log("ERROR", "AUTO_SELL_BALANCE_ERROR", str(e)[:200])
@@ -1452,7 +1813,7 @@ async def afternoon_auto_sell():
     _log("INFO", "AUTO_SELL_HOLDINGS", f"count={len(holdings)}")
 
     # 전량 매도 실행
-    sell_results = await loop.run_in_executor(None, kis.sell_all_holdings)
+    sell_results = await loop.run_in_executor(None, kis.sell_all_holdings, "KR")
 
     # DB 기록 + 임베드 작성
     result_lines: list[str] = []
@@ -1467,11 +1828,15 @@ async def afternoon_auto_sell():
                 sr["qty"], sr["sell_price"],
                 order_no=sr.get("order_no", ""),
                 reason="데이트레이딩 자동매도",
+                market="KR",
+                currency="KRW",
             )
             if sr["avg_price"] > 0 and sr["sell_price"] > 0:
                 record_pnl(
                     sr["ticker"], sr["name"],
                     sr["avg_price"], sr["sell_price"], sr["qty"],
+                    market="KR",
+                    currency="KRW",
                 )
             pnl = (sr["sell_price"] - sr["avg_price"]) * sr["qty"]
             pnl_rate = (
@@ -1486,8 +1851,9 @@ async def afternoon_auto_sell():
             emoji = "🟢" if pnl >= 0 else "🔴"
             result_lines.append(
                 f"{emoji} **{sr['name']}** (`{sr['ticker']}`) — "
-                f"{sr['qty']}주 | {sr['avg_price']:,}→{sr['sell_price']:,}원 | "
-                f"{pnl:+,}원 ({pnl_rate:+.1f}%)"
+                f"{sr['qty']}주 | {_format_money(sr['avg_price'], 'KRW')}→"
+                f"{_format_money(sr['sell_price'], 'KRW')} | "
+                f"{_format_money(pnl, 'KRW')} ({pnl_rate:+.1f}%)"
             )
         else:
             result_lines.append(
@@ -1502,23 +1868,33 @@ async def afternoon_auto_sell():
         for sr in failed:
             try:
                 retry = await loop.run_in_executor(
-                    None, kis.sell_stock, sr["ticker"], sr["qty"]
+                    None, kis.sell_stock, sr["ticker"], sr["qty"], 0, "KR"
                 )
                 if retry["success"]:
                     try:
-                        sp = await loop.run_in_executor(None, kis.get_price, sr["ticker"])
+                        sp = await loop.run_in_executor(None, kis.get_price, sr["ticker"], "KR")
                     except Exception:
                         sp = 0
                     record_trade(
                         sr["ticker"], sr["name"], "SELL", sr["qty"], sp,
                         order_no=retry.get("order_no", ""),
                         reason="데이트레이딩 재시도매도",
+                        market="KR",
+                        currency="KRW",
                     )
                     if sr["avg_price"] > 0 and sp > 0:
-                        record_pnl(sr["ticker"], sr["name"], sr["avg_price"], sp, sr["qty"])
+                        record_pnl(
+                            sr["ticker"],
+                            sr["name"],
+                            sr["avg_price"],
+                            sp,
+                            sr["qty"],
+                            market="KR",
+                            currency="KRW",
+                        )
                     pnl = (sp - sr["avg_price"]) * sr["qty"]
                     result_lines.append(
-                        f"✅ [재시도 성공] {sr['name']} — {pnl:+,}원"
+                        f"✅ [재시도 성공] {sr['name']} — {_format_money(pnl, 'KRW')}"
                     )
                     total_pnl += pnl
                 else:
@@ -1532,7 +1908,7 @@ async def afternoon_auto_sell():
 
     # 일일 손익 요약 임베드
     pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
-    cumulative = get_total_pnl()
+    cumulative = get_total_pnl(currency="KRW")
 
     sell_embed = discord.Embed(
         title="🌇 오후 전량매도 결과",
@@ -1541,17 +1917,17 @@ async def afternoon_auto_sell():
         timestamp=datetime.datetime.now(KST),
     )
     sell_embed.add_field(
-        name=f"{pnl_emoji} 오늘 손익", value=f"{total_pnl:+,}원", inline=True
+        name=f"{pnl_emoji} 오늘 손익", value=_format_money(total_pnl, "KRW"), inline=True
     )
     sell_embed.add_field(
-        name="투입금액", value=format_krw(total_invested), inline=True
+        name="투입금액", value=_format_money(total_invested, "KRW"), inline=True
     )
     sell_embed.add_field(
-        name="회수금액", value=format_krw(total_recovered), inline=True
+        name="회수금액", value=_format_money(total_recovered, "KRW"), inline=True
     )
     sell_embed.add_field(
         name="📊 누적 손익",
-        value=f"{cumulative['total_pnl']:+,}원 | 승률 {cumulative['win_rate']}%",
+        value=f"{_format_money(cumulative['total_pnl'], 'KRW')} | 승률 {cumulative['win_rate']}%",
         inline=False,
     )
     sell_embed.set_footer(text=f"데이 트레이딩 | {mode_label}")
@@ -1567,13 +1943,382 @@ async def before_afternoon():
     await bot.wait_until_ready()
 
 
+# ─── 스케줄: 미국 자동매수 (09:35 ET) ───────────────────────
+@tasks.loop(time=datetime.time(hour=_us_buy_h, minute=_us_buy_m, tzinfo=NY_TZ))
+async def us_morning_auto_buy():
+    """매일 오전(미국 현지) 상위 후보 분석 후 자동 매수."""
+    if not ENABLE_US_TRADING or not kis.enable_us_trading:
+        return
+    if not ALLOWED_CHANNEL_IDS or not kis.is_configured:
+        _log("INFO", "US_AUTO_BUY_SKIP", "채널 미설정 또는 KIS 미설정")
+        return
+    if not _is_market_day("US"):
+        _log("INFO", "US_AUTO_BUY_SKIP", "오늘은 미국시장 휴장일")
+        return
+    if not _is_market_open_now("US"):
+        _log("INFO", "US_AUTO_BUY_SKIP", "미국 장시간 아님")
+        return
+    if _analysis_lock.locked():
+        _log("INFO", "US_AUTO_BUY_SKIP", "analysis lock 사용 중")
+        return
+    if is_action_done("us_morning_buy"):
+        _log("INFO", "US_AUTO_BUY_SKIP", "오늘 us_morning_buy 이미 완료")
+        return
+
+    channel_id = next(iter(ALLOWED_CHANNEL_IDS))
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        _log("WARN", "US_AUTO_BUY_SKIP", f"채널 접근 실패 channel_id={channel_id}")
+        return
+
+    trade_date = str(datetime.datetime.now(NY_TZ).date())
+    mode_label = "🧪 모의투자" if kis.virtual else "💰 실전투자"
+    loop = asyncio.get_running_loop()
+
+    async with _analysis_lock:
+        _log("INFO", "US_AUTO_BUY_START", f"date={trade_date} target_picks={US_DAY_TRADE_PICKS}")
+        await channel.send(
+            f"🇺🇸🌅 **미국 자동매수** 시작 ({US_AUTO_BUY_TIME} ET)"
+        )
+
+        try:
+            scoring_msg = await channel.send("📊 미국 후보 스코어링 중… (KIS 우선, yfinance fallback)")
+            candidates = await _compute_us_stock_scores(count=max(10, US_DAY_TRADE_PICKS * 2))
+        except Exception as e:
+            _log("ERROR", "US_AUTO_BUY_SCORING_ERROR", str(e)[:200])
+            await channel.send(f"❌ 미국 후보 조회 실패: {str(e)[:300]}")
+            return
+
+        if not candidates:
+            _log("INFO", "US_AUTO_BUY_NO_CANDIDATE", "후보 없음")
+            await scoring_msg.edit(content="❌ 미국 매수 후보가 없습니다.")
+            return
+
+        try:
+            balance_data = await loop.run_in_executor(None, kis.get_balance, "US")
+            held_tickers = {h["ticker"] for h in balance_data.get("holdings", [])}
+        except Exception:
+            held_tickers = set()
+
+        filtered = [c for c in candidates if c["ticker"] not in held_tickers]
+        if not filtered:
+            await scoring_msg.edit(content="📋 후보 종목이 모두 이미 보유 중입니다.")
+            return
+
+        desc_lines = []
+        for c in filtered:
+            sig_str = ", ".join(c["signals"])
+            desc_lines.append(
+                f"**{c['score']}점** {c['name']} (`{c['ticker']}`) "
+                f"— {_format_money(c['price'], 'USD')} ({c['prdy_ctrt']:+.2f}%) | {sig_str}"
+            )
+        score_embed = discord.Embed(
+            title=f"🇺🇸 후보 TOP {len(filtered)}",
+            description="\n".join(desc_lines),
+            color=0x0066FF,
+            timestamp=datetime.datetime.now(NY_TZ),
+        )
+        score_embed.set_footer(text=f"{mode_label} | USD")
+        await scoring_msg.edit(content=None, embed=score_embed)
+
+        buy_targets: list[dict] = []
+        analyzed_count = 0
+        for c in filtered:
+            if len(buy_targets) >= US_DAY_TRADE_PICKS:
+                break
+            analyzed_count += 1
+            progress = await channel.send(
+                f"🔍 [{analyzed_count}/{min(len(filtered), US_DAY_TRADE_PICKS + 2)}] "
+                f"**{c['name']}** (`{c['ticker']}`) AI 분석 중…"
+            )
+            try:
+                ta = TradingAgentsGraph(debug=False, config=config)
+                final_state, decision = await loop.run_in_executor(
+                    None, ta.propagate, c["ticker"], trade_date
+                )
+                emoji = "🟢" if decision == "BUY" else "🔴" if decision == "SELL" else "🟡"
+                color_map = {"BUY": 0x00FF00, "SELL": 0xFF0000, "HOLD": 0xFFAA00}
+                summary = _extract_decision_summary(final_state, decision, c["ticker"], "US")
+                embed = discord.Embed(
+                    title=f"{emoji} {c['name']} ({c['ticker']}) → {decision}",
+                    description=summary,
+                    color=color_map.get(decision.upper(), 0x808080),
+                )
+                await progress.edit(content=None, embed=embed)
+
+                if decision.upper() == "BUY":
+                    buy_targets.append(c)
+                _log("INFO", "US_AUTO_BUY_ANALYZED", f"ticker={c['ticker']} decision={decision}")
+            except Exception as e:
+                _log("ERROR", "US_AUTO_BUY_ANALYZE_ERROR", f"ticker={c['ticker']} error={str(e)[:160]}")
+                await progress.edit(content=f"❌ {c['name']} 분석 실패: {str(e)[:200]}")
+
+        if not buy_targets:
+            await channel.send("📋 **미국 AI 분석 완료** — BUY 종목이 없어 매수를 건너뜁니다.")
+            return
+
+        try:
+            balance_data = await loop.run_in_executor(None, kis.get_balance, "US")
+            cash = balance_data.get("summary", {}).get("USD", {}).get("cash", 0)
+        except Exception as e:
+            _log("ERROR", "US_AUTO_BUY_BALANCE_ERROR", str(e)[:200])
+            await channel.send(f"❌ USD 잔액 조회 실패: {str(e)[:300]}")
+            return
+
+        if cash <= 0:
+            await channel.send("❌ USD 예수금이 0입니다. 매수를 건너뜁니다.")
+            return
+
+        per_stock_budget = float(cash) / len(buy_targets)
+        buy_results: list[str] = []
+        total_invested = 0.0
+
+        for target in buy_targets:
+            try:
+                current_price = await loop.run_in_executor(None, kis.get_price, target["ticker"], "US")
+            except Exception:
+                current_price = target["price"]
+            if current_price <= 0:
+                buy_results.append(f"⚠️ {target['name']} — 현재가 조회 실패")
+                continue
+
+            qty = int(per_stock_budget // current_price)
+            if qty <= 0:
+                buy_results.append(
+                    f"⚠️ {target['name']} — 예산({_format_money(per_stock_budget, 'USD')}) 부족"
+                )
+                continue
+
+            try:
+                fresh_bal = await loop.run_in_executor(None, kis.get_balance, "US")
+                remaining_cash = fresh_bal.get("summary", {}).get("USD", {}).get("cash", cash)
+            except Exception:
+                remaining_cash = cash
+
+            if qty * current_price > remaining_cash:
+                qty = int(remaining_cash // current_price)
+                if qty <= 0:
+                    buy_results.append(f"⚠️ {target['name']} — 잔액 부족")
+                    continue
+
+            try:
+                result = await loop.run_in_executor(None, kis.buy_stock, target["ticker"], qty, 0, "US")
+                if result["success"]:
+                    amount = qty * current_price
+                    total_invested += amount
+                    record_trade(
+                        target["ticker"],
+                        target["name"],
+                        "BUY",
+                        qty,
+                        current_price,
+                        order_no=result.get("order_no", ""),
+                        reason=f"미국 자동매수 (score={target['score']})",
+                        market="US",
+                        currency="USD",
+                    )
+                    buy_results.append(
+                        f"✅ {target['name']} ({target['ticker']}) — "
+                        f"{qty}주 × {_format_money(current_price, 'USD')} = {_format_money(amount, 'USD')}"
+                    )
+                else:
+                    buy_results.append(f"❌ {target['name']} 매수실패: {result['message'][:100]}")
+            except Exception as e:
+                buy_results.append(f"❌ {target['name']} 매수오류: {str(e)[:100]}")
+
+        result_embed = discord.Embed(
+            title=f"🇺🇸🌅 자동매수 결과 ({len(buy_targets)}종목)",
+            description="\n".join(buy_results),
+            color=0x00FF00,
+            timestamp=datetime.datetime.now(NY_TZ),
+        )
+        result_embed.add_field(name="투자금액", value=_format_money(total_invested, "USD"), inline=True)
+        result_embed.add_field(
+            name="예수금 잔액",
+            value=_format_money(max(cash - total_invested, 0), "USD"),
+            inline=True,
+        )
+        result_embed.set_footer(text=f"미국 데이 트레이딩 | {mode_label}")
+        await channel.send(embed=result_embed)
+
+        bought_names = ", ".join(t["name"] for t in buy_targets)
+        mark_action_done("us_morning_buy", details=f"매수: {bought_names}")
+        _log("INFO", "US_AUTO_BUY_DONE", f"buy_count={len(buy_targets)} invested={total_invested}")
+
+
+@us_morning_auto_buy.before_loop
+async def before_us_morning():
+    await bot.wait_until_ready()
+
+
+# ─── 스케줄: 미국 자동매도 (15:50 ET) ───────────────────────
+@tasks.loop(time=datetime.time(hour=_us_sell_h, minute=_us_sell_m, tzinfo=NY_TZ))
+async def us_afternoon_auto_sell():
+    """매일 오후(미국 현지) 보유 미국주식 전량 시장가 매도."""
+    if not ENABLE_US_TRADING or not kis.enable_us_trading:
+        return
+    if not ALLOWED_CHANNEL_IDS or not kis.is_configured:
+        _log("INFO", "US_AUTO_SELL_SKIP", "채널 미설정 또는 KIS 미설정")
+        return
+    if not _is_market_day("US"):
+        _log("INFO", "US_AUTO_SELL_SKIP", "미국시장 휴장일")
+        return
+    if not _is_market_open_now("US"):
+        _log("INFO", "US_AUTO_SELL_SKIP", "미국 장시간 아님")
+        return
+    if is_action_done("us_afternoon_sell"):
+        _log("INFO", "US_AUTO_SELL_SKIP", "오늘 us_afternoon_sell 이미 완료")
+        return
+
+    channel_id = next(iter(ALLOWED_CHANNEL_IDS))
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        _log("WARN", "US_AUTO_SELL_SKIP", f"채널 접근 실패 channel_id={channel_id}")
+        return
+
+    mode_label = "🧪 모의투자" if kis.virtual else "💰 실전투자"
+    loop = asyncio.get_running_loop()
+    _log("INFO", "US_AUTO_SELL_START", f"time={US_AUTO_SELL_TIME}")
+
+    await channel.send(f"🇺🇸🌇 **미국 자동매도** 시작 ({US_AUTO_SELL_TIME} ET)")
+
+    try:
+        balance_data = await loop.run_in_executor(None, kis.get_balance, "US")
+        holdings = balance_data.get("holdings", [])
+    except Exception as e:
+        _log("ERROR", "US_AUTO_SELL_BALANCE_ERROR", str(e)[:200])
+        await channel.send(f"❌ 미국 잔고 조회 실패: {str(e)[:300]}")
+        return
+
+    if not holdings:
+        await channel.send("📋 미국 보유 종목이 없습니다. 매도 생략.")
+        return
+
+    sell_results = await loop.run_in_executor(None, kis.sell_all_holdings, "US")
+
+    result_lines: list[str] = []
+    total_pnl = 0.0
+    total_invested = 0.0
+    total_recovered = 0.0
+
+    for sr in sell_results:
+        if sr["success"]:
+            record_trade(
+                sr["ticker"],
+                sr["name"],
+                "SELL",
+                sr["qty"],
+                sr["sell_price"],
+                order_no=sr.get("order_no", ""),
+                reason="미국 자동매도",
+                market="US",
+                currency="USD",
+            )
+            if sr["avg_price"] > 0 and sr["sell_price"] > 0:
+                record_pnl(
+                    sr["ticker"],
+                    sr["name"],
+                    sr["avg_price"],
+                    sr["sell_price"],
+                    sr["qty"],
+                    market="US",
+                    currency="USD",
+                )
+            pnl = (sr["sell_price"] - sr["avg_price"]) * sr["qty"]
+            pnl_rate = (
+                (sr["sell_price"] - sr["avg_price"]) / sr["avg_price"] * 100
+                if sr["avg_price"] > 0 else 0
+            )
+            invested = sr["avg_price"] * sr["qty"]
+            recovered = sr["sell_price"] * sr["qty"]
+            total_pnl += pnl
+            total_invested += invested
+            total_recovered += recovered
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            result_lines.append(
+                f"{emoji} **{sr['name']}** (`{sr['ticker']}`) — "
+                f"{sr['qty']}주 | {_format_money(sr['avg_price'], 'USD')}→{_format_money(sr['sell_price'], 'USD')} | "
+                f"{_format_money(pnl, 'USD')} ({pnl_rate:+.1f}%)"
+            )
+        else:
+            result_lines.append(f"❌ **{sr['name']}** (`{sr['ticker']}`) 매도실패: {sr['message'][:80]}")
+
+    failed = [sr for sr in sell_results if not sr["success"]]
+    if failed:
+        await channel.send(f"⚠️ 미국 매도 실패 {len(failed)}건 — 60초 후 재시도…")
+        await asyncio.sleep(60)
+        for sr in failed:
+            try:
+                retry = await loop.run_in_executor(None, kis.sell_stock, sr["ticker"], sr["qty"], 0, "US")
+                if retry["success"]:
+                    try:
+                        sp = await loop.run_in_executor(None, kis.get_price, sr["ticker"], "US")
+                    except Exception:
+                        sp = 0
+                    record_trade(
+                        sr["ticker"],
+                        sr["name"],
+                        "SELL",
+                        sr["qty"],
+                        sp,
+                        order_no=retry.get("order_no", ""),
+                        reason="미국 재시도매도",
+                        market="US",
+                        currency="USD",
+                    )
+                    if sr["avg_price"] > 0 and sp > 0:
+                        record_pnl(
+                            sr["ticker"],
+                            sr["name"],
+                            sr["avg_price"],
+                            sp,
+                            sr["qty"],
+                            market="US",
+                            currency="USD",
+                        )
+                    pnl = (sp - sr["avg_price"]) * sr["qty"]
+                    result_lines.append(f"✅ [재시도 성공] {sr['name']} — {_format_money(pnl, 'USD')}")
+                    total_pnl += pnl
+                else:
+                    result_lines.append(f"❌ [재시도 실패] {sr['name']}: {retry['message'][:80]}")
+            except Exception as e:
+                result_lines.append(f"❌ [재시도 오류] {sr['name']}: {str(e)[:80]}")
+
+    cumulative = get_total_pnl(currency="USD")
+    pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+    sell_embed = discord.Embed(
+        title="🇺🇸🌇 자동매도 결과",
+        description="\n".join(result_lines) if result_lines else "매도 대상 없음",
+        color=0x00FF00 if total_pnl >= 0 else 0xFF0000,
+        timestamp=datetime.datetime.now(NY_TZ),
+    )
+    sell_embed.add_field(name=f"{pnl_emoji} 오늘 손익", value=_format_money(total_pnl, "USD"), inline=True)
+    sell_embed.add_field(name="투입금액", value=_format_money(total_invested, "USD"), inline=True)
+    sell_embed.add_field(name="회수금액", value=_format_money(total_recovered, "USD"), inline=True)
+    sell_embed.add_field(
+        name="📊 USD 누적 손익",
+        value=f"{_format_money(cumulative['total_pnl'], 'USD')} | 승률 {cumulative['win_rate']}%",
+        inline=False,
+    )
+    sell_embed.set_footer(text=f"미국 데이 트레이딩 | {mode_label}")
+    await channel.send(embed=sell_embed)
+
+    mark_action_done("us_afternoon_sell", details=f"{len(sell_results)}종목 매도")
+    _log("INFO", "US_AUTO_SELL_DONE", f"sold={len(sell_results)} total_pnl={total_pnl}")
+
+
+@us_afternoon_auto_sell.before_loop
+async def before_us_afternoon():
+    await bot.wait_until_ready()
+
+
 # ─── 스케줄: 보유종목 손절/익절 모니터링 ─────────────────
 @tasks.loop(minutes=MONITOR_INTERVAL_MIN)
 async def monitor_holdings():
     """보유종목 수익률 감시 → 손절/익절 라인 도달 시 자동 매도."""
     if not ALLOWED_CHANNEL_IDS or not kis.is_configured:
         return
-    if not _is_market_day():
+    if not _is_market_day("KR") and not _is_market_day("US"):
         return
 
     channel_id = next(iter(ALLOWED_CHANNEL_IDS))
@@ -1595,24 +2340,27 @@ async def monitor_holdings():
 
     for h in holdings:
         rate = h["pnl_rate"]
+        market = h.get("market", _market_of_ticker(h["ticker"]))
+        if not _is_market_open_now(market):
+            continue
         triggered = False
         title = ""
         desc_extra = ""
 
         if rate <= STOP_LOSS_PCT:
             triggered = True
-            title = f"🚨 손절 자동매도: {h['name']}"
+            title = f"🚨 손절 자동매도: {h['name']} ({market})"
             desc_extra = f"⚠️ 손절 라인({STOP_LOSS_PCT}%) 도달 → 자동 시장가 매도"
         elif rate >= TAKE_PROFIT_PCT:
             triggered = True
-            title = f"🎉 익절 자동매도: {h['name']}"
+            title = f"🎉 익절 자동매도: {h['name']} ({market})"
             desc_extra = f"✅ 익절 라인({TAKE_PROFIT_PCT}%) 도달 → 자동 시장가 매도"
 
         if not triggered:
             continue
 
         # 재시작 중복 방지: 이 종목 오늘 이미 손절/익절 했으면 스킵
-        sl_action = f"stop_loss_{h['ticker']}"
+        sl_action = f"stop_loss_{market}_{h['ticker']}"
         if is_action_done(sl_action):
             _log("INFO", "MONITOR_SKIP_DONE", f"ticker={h['ticker']} already_triggered_today")
             continue
@@ -1620,34 +2368,50 @@ async def monitor_holdings():
         # 자동 매도 실행
         try:
             result = await loop.run_in_executor(
-                None, kis.sell_stock, h["ticker"], h["qty"]
+                None, kis.sell_stock, h["ticker"], h["qty"], 0, market
             )
             if result["success"]:
                 mark_action_done(sl_action, details=f"{rate:+.1f}%")
                 try:
-                    sell_price = await loop.run_in_executor(None, kis.get_price, h["ticker"])
+                    sell_price = await loop.run_in_executor(None, kis.get_price, h["ticker"], market)
                 except Exception:
                     sell_price = h["current_price"]
                 record_trade(
                     h["ticker"], h["name"], "SELL", h["qty"], sell_price,
                     order_no=result.get("order_no", ""),
                     reason=f"손절/익절 자동매도 ({rate:+.1f}%)",
+                    market=market,
+                    currency=h.get("currency", _currency_of_market(market)),
                 )
                 if h["avg_price"] > 0 and sell_price > 0:
-                    record_pnl(h["ticker"], h["name"], h["avg_price"], sell_price, h["qty"])
+                    record_pnl(
+                        h["ticker"],
+                        h["name"],
+                        h["avg_price"],
+                        sell_price,
+                        h["qty"],
+                        market=market,
+                        currency=h.get("currency", _currency_of_market(market)),
+                    )
+                currency = h.get("currency", _currency_of_market(market))
                 embed = discord.Embed(
                     title=title,
                     description=(
+                        f"**시장:** {market}\n"
                         f"**종목:** {h['name']} (`{h['ticker']}`)\n"
-                        f"**매도:** {h['qty']}주 × {sell_price:,}원\n"
-                        f"**손익:** {h['pnl']:+,}원 ({rate:+.2f}%)\n\n"
+                        f"**매도:** {h['qty']}주 × {_format_money(sell_price, currency)}\n"
+                        f"**손익:** {_format_money(h['pnl'], currency)} ({rate:+.2f}%)\n\n"
                         f"{desc_extra}"
                     ),
                     color=0xFF0000 if rate < 0 else 0x00FF00,
                 )
-                embed.set_footer(text=mode_label)
+                embed.set_footer(text=f"{mode_label} | {currency}")
                 await channel.send(embed=embed)
-                _log("INFO", "MONITOR_SELL_DONE", f"ticker={h['ticker']} qty={h['qty']} rate={rate:+.2f}%")
+                _log(
+                    "INFO",
+                    "MONITOR_SELL_DONE",
+                    f"market={market} ticker={h['ticker']} qty={h['qty']} rate={rate:+.2f}%",
+                )
             else:
                 _log("WARN", "MONITOR_SELL_FAIL", f"ticker={h['ticker']} message={result['message'][:120]}")
                 await channel.send(
@@ -1673,6 +2437,10 @@ async def on_ready():
         morning_auto_buy.start()
     if not afternoon_auto_sell.is_running():
         afternoon_auto_sell.start()
+    if ENABLE_US_TRADING and not us_morning_auto_buy.is_running():
+        us_morning_auto_buy.start()
+    if ENABLE_US_TRADING and not us_afternoon_auto_sell.is_running():
+        us_afternoon_auto_sell.start()
     if not monitor_holdings.is_running():
         monitor_holdings.start()
     print(f"✅ {bot.user} 로그인 완료!")
@@ -1681,8 +2449,13 @@ async def on_ready():
     print("   슬래시 명령: /분석, /대형주, /잔고, /매도, /상태, /봇정보, /수익")
     print(f"   KIS: {'✅ 설정됨' if kis.is_configured else '❌ 미설정'}")
     print(f"   모드: {'🧪 모의투자' if kis.virtual else '💰 실전투자'}")
-    print(f"   데이 트레이딩: 매수 {AUTO_BUY_TIME} / 매도 {AUTO_SELL_TIME} KST")
-    print(f"   매수 종목 수: {DAY_TRADE_PICKS}개 | 예산: 통장 전액")
+    print(f"   KR 데이 트레이딩: 매수 {AUTO_BUY_TIME} / 매도 {AUTO_SELL_TIME} KST")
+    print(f"   KR 매수 종목 수: {DAY_TRADE_PICKS}개 | 예산: 통장 전액")
+    if ENABLE_US_TRADING:
+        print(f"   US 데이 트레이딩: 매수 {US_AUTO_BUY_TIME} / 매도 {US_AUTO_SELL_TIME} ET")
+        print(f"   US 매수 종목 수: {US_DAY_TRADE_PICKS}개 | 예산: USD 예수금")
+    else:
+        print("   US 데이 트레이딩: 비활성화 (ENABLE_US_TRADING=false)")
     print(f"   손절: {STOP_LOSS_PCT}% | 익절: {TAKE_PROFIT_PCT}%")
     print(f"   모니터링: {MONITOR_INTERVAL_MIN}분 간격")
     if ALLOWED_CHANNEL_IDS:

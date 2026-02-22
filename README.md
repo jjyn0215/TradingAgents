@@ -213,10 +213,21 @@ KIS_ACCOUNT_NO=12345678-01          # 계좌번호
 KIS_VIRTUAL=true                    # true=모의투자, false=실전
 KIS_MAX_ORDER_AMOUNT=1000000        # 수동(/분석,/대형주) 1회 매수 예산 상한
 
+# ─── 미국(US) 거래 설정 ───────────────────────────────
+ENABLE_US_TRADING=false             # 미국 자동주문 활성화
+US_MAX_ORDER_AMOUNT=5000            # 수동(/분석) 미국 매수 예산 상한 (USD)
+US_EXCHANGE_SEARCH_ORDER=NASD,NYSE,AMEX
+US_WATCHLIST=AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD,AVGO,QQQ,SPY
+
 # ─── 데이 트레이딩 설정 ──────────────────────────────
 DAY_TRADE_PICKS=5                   # 매일 매수할 종목 수 (기본 5)
 AUTO_BUY_TIME=09:30                 # 자동 매수 시각 KST (기본 09:30)
 AUTO_SELL_TIME=15:20                # 자동 매도 시각 KST (기본 15:20)
+
+# ─── 미국 데이 트레이딩 설정 (뉴욕시간 ET) ─────────────
+US_DAY_TRADE_PICKS=5                # 미국 자동매수 종목 수
+US_AUTO_BUY_TIME=09:35              # 미국 자동 매수 시각 ET
+US_AUTO_SELL_TIME=15:50             # 미국 자동 매도 시각 ET
 
 # ─── 손절/익절 설정 ──────────────────────────────
 STOP_LOSS_PCT=-5.0                  # 손절 라인 (%, 기본 -5%)
@@ -276,6 +287,7 @@ python bot.py
 
 - 분석 완료 시 **색상 코딩된 Embed** (BUY=🟢, SELL=🔴, HOLD=🟡) 표시
 - **전체 보고서**는 `.md` 파일로 첨부
+- 티커는 **시장 자동판단**: `005930`(KR), `AAPL`(US)
 - **BUY** → 매수 확인 버튼 표시 (KIS 설정 시)
 - **SELL + 해당 종목 보유 중** → 매도 확인 버튼 표시
 - **HOLD / SELL(미보유)** → Embed만 표시
@@ -310,11 +322,12 @@ python bot.py
 | `/잔고` | 보유종목, 평가손익, 예수금 조회 |
 | `/매도 <종목코드>` | 전량 시장가 매도 (확인 버튼) |
 | `/매도 <종목코드> <수량>` | 지정 수량 매도 (확인 버튼) |
-| `/수익` | 누적 실현손익, 승률, 종목별 수익 조회 |
+| `/수익` | 누적 실현손익(통화분리), 승률, 종목별 수익 조회 |
 | `/상태` | 오늘 자동매매 실행 상태 조회 |
 | `/봇정보` | 스케줄/설정/계좌/실행이력 통합 조회 |
 
-- 잔고 조회 시 각 종목의 **평균매수가 → 현재가**, **손익금액**, **수익률** 표시
+- 잔고 조회 시 각 종목의 **시장(KR/US)**, **평균매수가 → 현재가**, **손익금액**, **수익률** 표시
+- `/수익`은 KRW/USD를 분리 집계하여 환산 왜곡을 방지
 - 매도 시 **확인/취소 버튼**이 나타나며, 확인 클릭 시에만 실행
 
 ### 자동 스케줄 (데이 트레이딩)
@@ -346,6 +359,13 @@ python bot.py
 2. 실패 종목 60초 후 1회 자동 재시도
 3. 종목별 손익 + 일일 합산 + 누적 승률 Discord 보고
 4. 모든 거래 SQLite DB에 자동 기록 (`/수익`으로 조회)
+
+#### 미국 자동 스케줄 (ENABLE_US_TRADING=true)
+
+1. **미국 자동매수**: `US_AUTO_BUY_TIME` (기본 09:35 ET)
+2. **미국 자동매도**: `US_AUTO_SELL_TIME` (기본 15:50 ET)
+3. 미국 자동매수 후보: **KIS 해외 랭킹 API 우선**, 실패 시 `US_WATCHLIST` 기반 yfinance fallback
+4. 상태키 분리: `us_morning_buy`, `us_afternoon_sell`
 
 ### Python 직접 사용
 

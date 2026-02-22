@@ -2,7 +2,7 @@
 매매 이력 관리 (SQLite)
 - 매수/매도 기록 저장
 - 누적 수익률 조회
-- 종목별 수익 요약
+- 통화별 수익 요약
 - 일일 상태 관리 (재시작 중복 방지)
 """
 
@@ -21,18 +21,38 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
+def _migrate_schema(conn: sqlite3.Connection):
+    """기존 DB에 누락 컬럼을 idempotent하게 추가."""
+    if not _has_column(conn, "trades", "market"):
+        conn.execute("ALTER TABLE trades ADD COLUMN market TEXT NOT NULL DEFAULT 'KR'")
+    if not _has_column(conn, "trades", "currency"):
+        conn.execute("ALTER TABLE trades ADD COLUMN currency TEXT NOT NULL DEFAULT 'KRW'")
+    if not _has_column(conn, "pnl_log", "market"):
+        conn.execute("ALTER TABLE pnl_log ADD COLUMN market TEXT NOT NULL DEFAULT 'KR'")
+    if not _has_column(conn, "pnl_log", "currency"):
+        conn.execute("ALTER TABLE pnl_log ADD COLUMN currency TEXT NOT NULL DEFAULT 'KRW'")
+
+
 def init_db():
-    """테이블 생성 (최초 1회)"""
+    """테이블 생성 (최초 1회) + 스키마 마이그레이션."""
     conn = _get_conn()
-    conn.executescript("""
+    conn.executescript(
+        """
         CREATE TABLE IF NOT EXISTS trades (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ticker      TEXT NOT NULL,
             name        TEXT NOT NULL DEFAULT '',
             side        TEXT NOT NULL CHECK(side IN ('BUY', 'SELL')),
             qty         INTEGER NOT NULL,
-            price       INTEGER NOT NULL,
-            amount      INTEGER NOT NULL,
+            price       REAL NOT NULL,
+            amount      REAL NOT NULL,
+            market      TEXT NOT NULL DEFAULT 'KR',
+            currency    TEXT NOT NULL DEFAULT 'KRW',
             order_no    TEXT DEFAULT '',
             reason      TEXT DEFAULT '',
             created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
@@ -42,11 +62,13 @@ def init_db():
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ticker      TEXT NOT NULL,
             name        TEXT NOT NULL DEFAULT '',
-            buy_price   INTEGER NOT NULL,
-            sell_price  INTEGER NOT NULL,
+            buy_price   REAL NOT NULL,
+            sell_price  REAL NOT NULL,
             qty         INTEGER NOT NULL,
-            pnl         INTEGER NOT NULL,
+            pnl         REAL NOT NULL,
             pnl_rate    REAL NOT NULL,
+            market      TEXT NOT NULL DEFAULT 'KR',
+            currency    TEXT NOT NULL DEFAULT 'KRW',
             created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         );
 
@@ -57,7 +79,10 @@ def init_db():
             details      TEXT DEFAULT '',
             PRIMARY KEY (date, action)
         );
-    """)
+    """
+    )
+
+    _migrate_schema(conn)
     conn.commit()
     conn.close()
 
@@ -67,16 +92,25 @@ def record_trade(
     name: str,
     side: str,
     qty: int,
-    price: int,
+    price: float,
     order_no: str = "",
     reason: str = "",
+    market: str = "KR",
+    currency: str = "KRW",
 ):
-    """매수/매도 기록 저장"""
+    """매수/매도 기록 저장."""
+    side = side.upper()
+    market = (market or "KR").upper()
+    currency = (currency or "KRW").upper()
+    px = float(price)
+    amount = float(qty) * px
+
     conn = _get_conn()
     conn.execute(
-        """INSERT INTO trades (ticker, name, side, qty, price, amount, order_no, reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (ticker, name, side.upper(), qty, price, qty * price, order_no, reason),
+        """INSERT INTO trades
+           (ticker, name, side, qty, price, amount, market, currency, order_no, reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ticker, name, side, qty, px, amount, market, currency, order_no, reason),
     )
     conn.commit()
     conn.close()
@@ -85,40 +119,62 @@ def record_trade(
 def record_pnl(
     ticker: str,
     name: str,
-    buy_price: int,
-    sell_price: int,
+    buy_price: float,
+    sell_price: float,
     qty: int,
+    market: str = "KR",
+    currency: str = "KRW",
 ):
-    """실현 손익 기록"""
-    pnl = (sell_price - buy_price) * qty
-    pnl_rate = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
+    """실현 손익 기록."""
+    buy_px = float(buy_price)
+    sell_px = float(sell_price)
+    pnl = (sell_px - buy_px) * qty
+    pnl_rate = ((sell_px - buy_px) / buy_px * 100) if buy_px > 0 else 0.0
+    market = (market or "KR").upper()
+    currency = (currency or "KRW").upper()
+
     conn = _get_conn()
     conn.execute(
-        """INSERT INTO pnl_log (ticker, name, buy_price, sell_price, qty, pnl, pnl_rate)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (ticker, name, buy_price, sell_price, qty, pnl, round(pnl_rate, 2)),
+        """INSERT INTO pnl_log
+           (ticker, name, buy_price, sell_price, qty, pnl, pnl_rate, market, currency)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ticker, name, buy_px, sell_px, qty, pnl, round(pnl_rate, 2), market, currency),
     )
     conn.commit()
     conn.close()
 
 
-def get_total_pnl() -> dict:
-    """누적 수익 요약"""
+def _aggregate_pnl(
+    market: str | None = None,
+    currency: str | None = None,
+) -> dict:
     conn = _get_conn()
+    conditions: list[str] = []
+    params: list[str] = []
+    if market:
+        conditions.append("market = ?")
+        params.append(market.upper())
+    if currency:
+        conditions.append("currency = ?")
+        params.append(currency.upper())
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     row = conn.execute(
-        """SELECT
+        f"""SELECT
              COALESCE(SUM(pnl), 0) as total_pnl,
              COUNT(*) as trade_count,
              COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) as win_count,
              COALESCE(SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END), 0) as loss_count
-           FROM pnl_log"""
+           FROM pnl_log
+           {where_clause}""",
+        params,
     ).fetchone()
     conn.close()
 
-    total = row["total_pnl"]
-    count = row["trade_count"]
-    win = row["win_count"]
-    loss = row["loss_count"]
+    total = float(row["total_pnl"])
+    count = int(row["trade_count"])
+    win = int(row["win_count"])
+    loss = int(row["loss_count"])
     win_rate = (win / count * 100) if count > 0 else 0.0
 
     return {
@@ -130,38 +186,104 @@ def get_total_pnl() -> dict:
     }
 
 
-def get_recent_trades(limit: int = 20) -> list[dict]:
-    """최근 매매 이력"""
+def get_total_pnl(
+    market: str | None = None,
+    currency: str | None = None,
+) -> dict:
+    """누적 수익 요약 (기존 호환: 인자 없이 전체 반환)."""
+    return _aggregate_pnl(market=market, currency=currency)
+
+
+def get_total_pnl_by_currency() -> dict[str, dict]:
+    """통화별 누적 수익 요약."""
     conn = _get_conn()
     rows = conn.execute(
-        "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+        "SELECT DISTINCT currency FROM pnl_log ORDER BY currency"
+    ).fetchall()
+    conn.close()
+
+    currencies = [r["currency"] for r in rows] or ["KRW", "USD"]
+    result: dict[str, dict] = {}
+    for cur in currencies:
+        result[cur] = _aggregate_pnl(currency=cur)
+    return result
+
+
+def get_recent_trades(
+    limit: int = 20,
+    market: str | None = None,
+    currency: str | None = None,
+) -> list[dict]:
+    """최근 매매 이력."""
+    conn = _get_conn()
+    conditions: list[str] = []
+    params: list[object] = []
+    if market:
+        conditions.append("market = ?")
+        params.append(market.upper())
+    if currency:
+        conditions.append("currency = ?")
+        params.append(currency.upper())
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+    rows = conn.execute(
+        f"SELECT * FROM trades {where_clause} ORDER BY id DESC LIMIT ?", params
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def get_recent_pnl(limit: int = 20) -> list[dict]:
-    """최근 실현손익"""
+def get_recent_pnl(
+    limit: int = 20,
+    market: str | None = None,
+    currency: str | None = None,
+) -> list[dict]:
+    """최근 실현손익."""
     conn = _get_conn()
+    conditions: list[str] = []
+    params: list[object] = []
+    if market:
+        conditions.append("market = ?")
+        params.append(market.upper())
+    if currency:
+        conditions.append("currency = ?")
+        params.append(currency.upper())
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
     rows = conn.execute(
-        "SELECT * FROM pnl_log ORDER BY id DESC LIMIT ?", (limit,)
+        f"SELECT * FROM pnl_log {where_clause} ORDER BY id DESC LIMIT ?", params
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def get_ticker_summary() -> list[dict]:
-    """종목별 누적 수익 요약"""
+def get_ticker_summary(
+    market: str | None = None,
+    currency: str | None = None,
+) -> list[dict]:
+    """종목별 누적 수익 요약."""
     conn = _get_conn()
+    conditions: list[str] = []
+    params: list[str] = []
+    if market:
+        conditions.append("market = ?")
+        params.append(market.upper())
+    if currency:
+        conditions.append("currency = ?")
+        params.append(currency.upper())
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     rows = conn.execute(
-        """SELECT
-             ticker, name,
+        f"""SELECT
+             ticker, name, market, currency,
              COUNT(*) as count,
              SUM(pnl) as total_pnl,
              AVG(pnl_rate) as avg_pnl_rate
            FROM pnl_log
-           GROUP BY ticker
-           ORDER BY total_pnl DESC"""
+           {where_clause}
+           GROUP BY ticker, name, market, currency
+           ORDER BY total_pnl DESC""",
+        params,
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -172,7 +294,7 @@ def is_action_done(action: str, date: str | None = None) -> bool:
     """오늘 해당 액션이 이미 완료되었는지 확인.
 
     Args:
-        action: 'morning_buy', 'afternoon_sell', 'stop_loss_005930' 등
+        action: 'morning_buy', 'afternoon_sell', 'us_morning_buy' 등
         date: 날짜 (기본: 오늘)
     """
     if date is None:
@@ -187,13 +309,7 @@ def is_action_done(action: str, date: str | None = None) -> bool:
 
 
 def mark_action_done(action: str, details: str = "", date: str | None = None):
-    """해당 액션을 완료로 표시.
-
-    Args:
-        action: 'morning_buy', 'afternoon_sell', 'stop_loss_005930' 등
-        details: 추가 정보 (매수 종목 등)
-        date: 날짜 (기본: 오늘)
-    """
+    """해당 액션을 완료로 표시."""
     if date is None:
         date = datetime.date.today().isoformat()
     now = datetime.datetime.now().isoformat()
