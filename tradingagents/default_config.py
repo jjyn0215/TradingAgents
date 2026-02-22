@@ -8,12 +8,12 @@ DEFAULT_CONFIG = {
         "dataflows/data_cache",
     ),
     # LLM settings
-    "llm_provider": "openai",
-    "deep_think_llm": "gpt-5.2",
-    "quick_think_llm": "gpt-5-mini",
-    "backend_url": "https://api.openai.com/v1",
+    "llm_provider": "google",  # Options: openai, anthropic, google, xai, gemini
+    "deep_think_llm": "gemini-3-pro-preview",
+    "quick_think_llm": "gemini-3-flash-preview",
+    "backend_url": "https://generativelanguage.googleapis.com",
     # Provider-specific thinking configuration
-    "google_thinking_level": None,      # "high", "minimal", etc.
+    "google_thinking_level": "high",      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
     # Debate and discussion settings
     "max_debate_rounds": 1,

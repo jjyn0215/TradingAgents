@@ -40,6 +40,8 @@ Conversation history of the debate: {history}
 Last bear argument: {current_response}
 Reflections from similar situations and lessons learned: {past_memory_str}
 Use this information to deliver a compelling bull argument, refute the bear's concerns, and engage in a dynamic debate that demonstrates the strengths of the bull position. You must also address reflections and learn from lessons and mistakes you made in the past.
+
+반드시 모든 분석과 토론 내용을 한국어로 작성하세요.
 """
 
         response = llm.invoke(prompt)

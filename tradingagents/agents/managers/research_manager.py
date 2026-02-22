@@ -35,7 +35,9 @@ Here are your past reflections on mistakes:
 
 Here is the debate:
 Debate History:
-{history}"""
+{history}
+
+반드시 모든 분석, 추천, 투자 계획을 한국어로 작성하세요."""
         response = llm.invoke(prompt)
 
         new_investment_debate_state = {
