@@ -8,10 +8,12 @@ TradingAgents Discord Bot
 import os
 import asyncio
 import datetime
+import re
 from io import BytesIO
 from zoneinfo import ZoneInfo
 
 import discord
+import yfinance as yf
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
@@ -83,6 +85,7 @@ _analysis_lock = asyncio.Lock()
 # ─── KIS 클라이언트 초기화 ──────────────────────────────────
 kis = KISClient()
 KST = ZoneInfo("Asia/Seoul")
+TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
 
 
 def _log(level: str, event: str, message: str):
@@ -108,6 +111,62 @@ def _yf_ticker(ticker: str) -> str:
     if ticker.isdigit() and len(ticker) == 6:
         return f"{ticker}.KS"
     return ticker
+
+
+def _parse_trade_date(date_text: str | None) -> str:
+    """사용자 입력 날짜를 YYYY-MM-DD로 정규화."""
+    if not date_text:
+        return str(datetime.date.today())
+    try:
+        parsed = datetime.datetime.strptime(date_text.strip(), "%Y-%m-%d").date()
+        return parsed.isoformat()
+    except ValueError as exc:
+        raise ValueError("날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형식으로 입력하세요.") from exc
+
+
+def _validate_ticker_format(ticker: str) -> str | None:
+    """티커 문자열 형식 검증."""
+    if not ticker:
+        return "티커를 입력해주세요."
+    if not TICKER_PATTERN.fullmatch(ticker):
+        return "티커 형식이 올바르지 않습니다. 예: AAPL, BRK-B, 005930"
+    return None
+
+
+def _ticker_has_market_data(ticker: str) -> bool:
+    """실제 종목 데이터가 존재하는지 확인."""
+    # 한국 6자리 종목은 KIS 시세를 우선 확인
+    if ticker.isdigit() and len(ticker) == 6 and kis.is_configured:
+        try:
+            return kis.get_price(ticker) > 0
+        except Exception as e:
+            _log("WARN", "TICKER_VALIDATE_KIS_FAIL", f"ticker={ticker} error={str(e)[:160]}")
+
+    # 글로벌 티커 포함 yfinance로 최종 확인
+    try:
+        hist = yf.Ticker(_yf_ticker(ticker)).history(period="1mo", interval="1d")
+        if hist.empty or "Close" not in hist.columns:
+            return False
+        return not hist["Close"].dropna().empty
+    except Exception:
+        return False
+
+
+async def _validate_analysis_ticker(ticker: str) -> tuple[bool, str]:
+    """분석 요청 전에 티커 유효성 검증."""
+    format_error = _validate_ticker_format(ticker)
+    if format_error:
+        return False, format_error
+
+    loop = asyncio.get_running_loop()
+    has_data = await loop.run_in_executor(None, _ticker_has_market_data, ticker)
+    if not has_data:
+        return (
+            False,
+            f"`{ticker}` 종목 데이터를 찾지 못했습니다. "
+            "오타 여부와 거래소 접미사(예: 005930, AAPL, 7203.T)를 확인해주세요.",
+        )
+    return True, ""
 
 
 def _is_market_day() -> bool:
@@ -679,7 +738,11 @@ async def analyze(
     date: str | None = None,
 ):
     ticker = ticker.upper().strip()
-    trade_date = date or str(datetime.date.today())
+    try:
+        trade_date = _parse_trade_date(date)
+    except ValueError as e:
+        await interaction.response.send_message(f"❌ {str(e)}", ephemeral=True)
+        return
 
     await interaction.response.defer(thinking=True)
     _log("INFO", "SLASH_ANALYZE_START", f"{_interaction_actor(interaction)} ticker={ticker} date={trade_date}")
@@ -696,6 +759,12 @@ async def analyze(
         await interaction.followup.send(
             "⏳ 이미 다른 분석이 진행 중입니다. 잠시 후 다시 시도해주세요."
         )
+        return
+
+    is_valid_ticker, ticker_error = await _validate_analysis_ticker(ticker)
+    if not is_valid_ticker:
+        _log("WARN", "SLASH_ANALYZE_INVALID_TICKER", f"ticker={ticker} reason={ticker_error}")
+        await interaction.followup.send(f"❌ {ticker_error}")
         return
 
     async with _analysis_lock:
@@ -753,7 +822,12 @@ async def analyze(
 @tree.command(name="대형주", description="코스피 시가총액 TOP5 분석 + 매수 추천")
 @app_commands.describe(date="분석 기준일 (YYYY-MM-DD, 기본: 오늘)")
 async def top_stocks(interaction: discord.Interaction, date: str | None = None):
-    trade_date = date or str(datetime.date.today())
+    try:
+        trade_date = _parse_trade_date(date)
+    except ValueError as e:
+        await interaction.response.send_message(f"❌ {str(e)}", ephemeral=True)
+        return
+
     await interaction.response.defer(thinking=True)
     _log("INFO", "SLASH_TOP5_START", f"{_interaction_actor(interaction)} date={trade_date}")
 
