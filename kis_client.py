@@ -166,6 +166,39 @@ class KISClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _ranking_request(
+        self,
+        path: str,
+        tr_id: str,
+        params: dict | None = None,
+        *,
+        retries: int = 2,
+        base_delay_sec: float = 0.35,
+    ) -> dict:
+        """순위성 GET API 전용 재시도 래퍼.
+
+        - 5xx/429/네트워크 오류는 재시도
+        - 그 외 4xx는 즉시 실패
+        """
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return self._request("GET", path, tr_id, params=params)
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                last_error = e
+                if status is not None and status < 500 and status != 429:
+                    raise
+            except Exception as e:
+                last_error = e
+
+            if attempt < retries:
+                time.sleep(base_delay_sec * (attempt + 1))
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"ranking request failed: {path}")
+
     # ── 시장 상태 ─────────────────────────────────────────────
 
     def is_market_open(self, dt: datetime.date | None = None, market: str = "KR") -> bool:
@@ -182,6 +215,13 @@ class KISClient:
 
         # KR
         key = dt.strftime("%Y%m%d")
+        # KIS 문서상 모의투자는 chk-holiday API 미지원.
+        # 모의환경에서는 불필요한 500 오류를 피하기 위해 주말만 휴장으로 간주한다.
+        if self.virtual:
+            is_open = dt.weekday() < 5
+            self._holiday_cache[key] = is_open
+            return is_open
+
         if dt.weekday() >= 5:
             return False
         if key in self._holiday_cache:
@@ -331,7 +371,7 @@ class KISClient:
                 "summary": {"total_eval": 0.0, "total_pnl": 0.0, "cash": 0.0, "currency": "USD"},
             }
 
-        tr_id = os.getenv("KIS_US_BALANCE_TR_ID", "VTTT3012R" if self.virtual else "TTTS3012R")
+        tr_id = os.getenv("KIS_US_BALANCE_TR_ID", "VTTS3012R" if self.virtual else "TTTS3012R")
         path = os.getenv("KIS_US_BALANCE_PATH", "/uapi/overseas-stock/v1/trading/inquire-balance")
 
         holdings_map: dict[tuple[str, str], dict] = {}
@@ -528,9 +568,12 @@ class KISClient:
         return self._order_kr("SELL", t, qty, price)
 
     def _order_kr(self, side: Literal["BUY", "SELL"], ticker: str, qty: int, price: float = 0) -> dict:
-        tr_id = "VTTC0802U" if side == "BUY" and self.virtual else "TTTC0802U"
+        tr_id = "VTTC0012U" if side == "BUY" and self.virtual else "TTTC0012U"
         if side == "SELL":
-            tr_id = "VTTC0801U" if self.virtual else "TTTC0801U"
+            tr_id = "VTTC0011U" if self.virtual else "TTTC0011U"
+        qty_int = int(qty)
+        excg_id_dvsn_cd = os.getenv("KIS_KR_EXCHANGE_ID", "KRX")
+        sll_type = "00" if side == "SELL" else ""
 
         data = self._request(
             "POST",
@@ -540,9 +583,12 @@ class KISClient:
                 "CANO": self.cano,
                 "ACNT_PRDT_CD": self.acnt_prdt_cd,
                 "PDNO": ticker,
+                "EXCG_ID_DVSN_CD": excg_id_dvsn_cd,
                 "ORD_DVSN": "01",  # 시장가
-                "ORD_QTY": str(qty),
+                "ORD_QTY": str(qty_int),
                 "ORD_UNPR": str(int(price)) if price else "0",
+                "SLL_TYPE": sll_type,
+                "CNDT_PRIC": "",
             },
         )
         return {
@@ -584,7 +630,9 @@ class KISClient:
         if side == "BUY":
             tr_id = os.getenv("KIS_US_BUY_TR_ID", "VTTT1002U" if self.virtual else "TTTT1002U")
         else:
-            tr_id = os.getenv("KIS_US_SELL_TR_ID", "VTTT1001U" if self.virtual else "TTTT1006U")
+            tr_id = os.getenv("KIS_US_SELL_TR_ID", "VTTT1006U" if self.virtual else "TTTT1006U")
+        qty_int = int(qty)
+        sll_type = "00" if side == "SELL" else ""
 
         try:
             data = self._request(
@@ -596,10 +644,13 @@ class KISClient:
                     "ACNT_PRDT_CD": self.acnt_prdt_cd,
                     "OVRS_EXCG_CD": exchange,
                     "PDNO": ticker,
-                    "ORD_QTY": str(qty),
+                    "ORD_QTY": str(qty_int),
                     "OVRS_ORD_UNPR": str(price) if price else "0",
                     "ORD_SVR_DVSN_CD": "0",
-                    "ORD_DVSN": "00",  # market
+                    "ORD_DVSN": "00",
+                    "SLL_TYPE": sll_type,
+                    "CTAC_TLNO": "",
+                    "MGCO_APTM_ODNO": "",
                 },
             )
             return {
@@ -625,8 +676,7 @@ class KISClient:
     def get_top_market_cap(self, count: int = 5) -> list[dict]:
         """코스피 시가총액 상위 종목 조회."""
         try:
-            data = self._request(
-                "GET",
+            data = self._ranking_request(
                 "/uapi/domestic-stock/v1/ranking/market-cap",
                 "FHPST01740000",
                 params={
@@ -669,8 +719,7 @@ class KISClient:
         """거래량 상위 종목 조회."""
         time.sleep(0.2)
         try:
-            data = self._request(
-                "GET",
+            data = self._ranking_request(
                 "/uapi/domestic-stock/v1/quotations/volume-rank",
                 "FHPST01710000",
                 params={
@@ -716,8 +765,7 @@ class KISClient:
         """체결강도 상위 종목 조회."""
         time.sleep(0.2)
         try:
-            data = self._request(
-                "GET",
+            data = self._ranking_request(
                 "/uapi/domestic-stock/v1/ranking/volume-power",
                 "FHPST01680000",
                 params={
@@ -760,8 +808,7 @@ class KISClient:
         """등락률 상위 종목 조회."""
         time.sleep(0.2)
         try:
-            data = self._request(
-                "GET",
+            data = self._ranking_request(
                 "/uapi/domestic-stock/v1/ranking/fluctuation",
                 "FHPST01700000",
                 params={
@@ -810,8 +857,7 @@ class KISClient:
         """대량체결건수 매수 상위 종목 조회."""
         time.sleep(0.2)
         try:
-            data = self._request(
-                "GET",
+            data = self._ranking_request(
                 "/uapi/domestic-stock/v1/ranking/bulk-trans-num",
                 "FHKST190900C0",
                 params={

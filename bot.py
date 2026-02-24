@@ -9,6 +9,7 @@ import os
 import asyncio
 import datetime
 import re
+from pathlib import Path
 from io import BytesIO
 from zoneinfo import ZoneInfo
 
@@ -100,6 +101,10 @@ kis = KISClient()
 KST = ZoneInfo("Asia/Seoul")
 NY_TZ = ZoneInfo("America/New_York")
 TICKER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
+REPORTS_DIR = Path(os.getenv("REPORTS_DIR", "reports"))
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+AUTO_REPORT_UPLOAD = os.getenv("AUTO_REPORT_UPLOAD", "true").lower() == "true"
+_analysis_symbol_cache: dict[str, str] = {}
 
 
 def _log(level: str, event: str, message: str):
@@ -113,19 +118,78 @@ def _interaction_actor(interaction: discord.Interaction) -> str:
     return f"user={user_label} channel={interaction.channel_id}"
 
 
-def _yf_ticker(ticker: str) -> str:
-    """한국 종목 코드(6자리 숫자)에 yfinance용 .KS 접미사 붙이기.
+def _latest_yf_close(symbol: str) -> float:
+    """yfinance 심볼의 최근 종가 조회 (실패 시 0)."""
+    try:
+        hist = yf.Ticker(symbol).history(period="7d", interval="1d")
+        if hist.empty or "Close" not in hist.columns:
+            return 0.0
+        close = hist["Close"].dropna()
+        if close.empty:
+            return 0.0
+        return float(close.iloc[-1])
+    except Exception:
+        return 0.0
 
-    예: '005930' → '005930.KS', 'AAPL' → 'AAPL' (변경 없음)
-    이미 .KS/.KQ가 붙어있으면 그대로 유지.
+
+def _resolve_analysis_symbol(
+    ticker: str,
+    market: str | None = None,
+    reference_price: float | None = None,
+) -> str:
+    """분석용 심볼 정규화.
+
+    - US: 티커 그대로 사용
+    - KR 6자리: .KS/.KQ 중 yfinance 데이터/가격 근접도로 자동 판별
     """
-    ticker = (ticker or "").upper()
-    if ticker.endswith((".KS", ".KQ")):
-        return ticker
-    # 6자리 숫자면 코스피 종목
-    if ticker.isdigit() and len(ticker) == 6:
-        return f"{ticker}.KS"
-    return ticker
+    t = (ticker or "").upper().strip()
+    m = (market or kis.detect_market(t)).upper()
+    if m != "KR":
+        return t
+    if t.endswith((".KS", ".KQ")):
+        return t
+    if not (t.isdigit() and len(t) == 6):
+        return t
+
+    if t in _analysis_symbol_cache:
+        return _analysis_symbol_cache[t]
+
+    ref = float(reference_price or 0)
+    if ref <= 0 and kis.is_configured:
+        try:
+            ref = float(kis.get_price(t, market="KR"))
+        except Exception:
+            ref = 0.0
+
+    candidates = [f"{t}.KS", f"{t}.KQ"]
+    prices = {sym: _latest_yf_close(sym) for sym in candidates}
+    available = {sym: px for sym, px in prices.items() if px > 0}
+
+    if not available:
+        resolved = f"{t}.KS"
+    elif len(available) == 1:
+        resolved = next(iter(available))
+    elif ref > 0:
+        resolved = min(
+            available.keys(),
+            key=lambda sym: abs(available[sym] - ref) / max(ref, 1.0),
+        )
+    else:
+        resolved = max(available.keys(), key=lambda sym: available[sym])
+
+    _analysis_symbol_cache[t] = resolved
+    if resolved != f"{t}.KS":
+        _log("INFO", "ANALYSIS_SYMBOL_RESOLVED", f"ticker={t} resolved={resolved}")
+    return resolved
+
+
+def _yf_ticker(ticker: str, reference_price: float | None = None) -> str:
+    """TradingAgents에 전달할 yfinance 심볼 반환."""
+    t = (ticker or "").upper().strip()
+    market = kis.detect_market(t)
+    if market == "KR":
+        return _resolve_analysis_symbol(t, market="KR", reference_price=reference_price)
+    return t
 
 
 def _market_of_ticker(ticker: str) -> str:
@@ -140,6 +204,56 @@ def _format_money(amount: float, currency: str) -> str:
     if currency == "USD":
         return format_usd(amount)
     return f"{amount:,.0f}원"
+
+
+def _save_report_markdown(
+    report_text: str,
+    *,
+    market: str,
+    ticker: str,
+    trade_date: str,
+    scope: str,
+) -> Path:
+    """분석 보고서를 reports 디렉터리에 저장."""
+    safe_market = re.sub(r"[^A-Z0-9_-]", "_", (market or "NA").upper())
+    safe_ticker = re.sub(r"[^A-Z0-9._-]", "_", (ticker or "UNKNOWN").upper())
+    safe_scope = re.sub(r"[^A-Z0-9_-]", "_", (scope or "analysis").upper())
+    stamp = datetime.datetime.now(KST).strftime("%Y%m%d_%H%M%S")
+    filename = f"{stamp}_{safe_scope}_{safe_market}_{safe_ticker}_{trade_date}.md"
+    path = REPORTS_DIR / filename
+    path.write_text(report_text, encoding="utf-8")
+    _log("INFO", "REPORT_SAVED", f"path={path}")
+    return path
+
+
+def _prepare_report_attachment(
+    report_text: str,
+    *,
+    market: str,
+    ticker: str,
+    trade_date: str,
+    scope: str,
+) -> tuple[discord.File, Path | None]:
+    """디스코드 업로드용 파일 객체와 (가능하면) 로컬 저장 경로를 반환."""
+    try:
+        saved_path = _save_report_markdown(
+            report_text,
+            market=market,
+            ticker=ticker,
+            trade_date=trade_date,
+            scope=scope,
+        )
+        return discord.File(str(saved_path), filename=saved_path.name), saved_path
+    except Exception as e:
+        _log(
+            "ERROR",
+            "REPORT_SAVE_FAIL",
+            f"scope={scope} market={market} ticker={ticker} error={str(e)[:160]}",
+        )
+        fallback_name = (
+            f"{scope}_{market}_{re.sub(r'[^A-Z0-9._-]', '_', ticker.upper())}_{trade_date}.md"
+        )
+        return discord.File(fp=BytesIO(report_text.encode("utf-8")), filename=fallback_name), None
 
 
 def _parse_trade_date(date_text: str | None) -> str:
@@ -165,17 +279,21 @@ def _validate_ticker_format(ticker: str) -> str | None:
 def _ticker_has_market_data(ticker: str) -> bool:
     """실제 종목 데이터가 존재하는지 확인."""
     market = _market_of_ticker(ticker)
+    kr_price = 0.0
 
     # 한국 6자리 종목은 KIS 시세를 우선 확인
     if market == "KR" and kis.is_configured:
         try:
-            return kis.get_price(ticker, market="KR") > 0
+            kr_price = float(kis.get_price(ticker, market="KR"))
+            if kr_price <= 0:
+                return False
         except Exception as e:
             _log("WARN", "TICKER_VALIDATE_KIS_FAIL", f"ticker={ticker} error={str(e)[:160]}")
 
     # 글로벌 티커 포함 yfinance로 최종 확인
     try:
-        hist = yf.Ticker(_yf_ticker(ticker)).history(period="1mo", interval="1d")
+        yf_symbol = _yf_ticker(ticker, reference_price=kr_price if market == "KR" else None)
+        hist = yf.Ticker(yf_symbol).history(period="1mo", interval="1d")
         if hist.empty or "Close" not in hist.columns:
             return False
         return not hist["Close"].dropna().empty
@@ -220,7 +338,13 @@ def _is_market_open_now(market: str = "KR") -> bool:
 
 
 # ─── Helper: 보고서 생성 ──────────────────────────────────────
-def _build_report_text(final_state: dict, ticker: str) -> str:
+def _build_report_text(
+    final_state: dict,
+    ticker: str,
+    *,
+    market: str | None = None,
+    analysis_symbol: str | None = None,
+) -> str:
     """final_state에서 Markdown 보고서 텍스트 생성."""
     sections: list[str] = []
 
@@ -274,7 +398,12 @@ def _build_report_text(final_state: dict, ticker: str) -> str:
             )
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"# 📋 트레이딩 분석 보고서: {ticker}\n\n생성일시: {now}\n\n"
+    header_lines = [f"# 📋 트레이딩 분석 보고서: {ticker}", "", f"생성일시: {now}"]
+    if market:
+        header_lines.append(f"시장: {market}")
+    if analysis_symbol and analysis_symbol.upper() != ticker.upper():
+        header_lines.append(f"분석 심볼: {analysis_symbol}")
+    header = "\n".join(header_lines) + "\n\n"
     return header + "\n\n".join(sections)
 
 
@@ -421,16 +550,12 @@ async def _compute_stock_scores(count: int = 10) -> list[dict]:
     """
     loop = asyncio.get_running_loop()
 
-    # 5개 순위 API 병렬 호출
-    volume_task = loop.run_in_executor(None, kis.get_volume_rank, 30)
-    power_task = loop.run_in_executor(None, kis.get_volume_power, 30)
-    fluct_task = loop.run_in_executor(None, kis.get_fluctuation_rank, 30)
-    bulk_task = loop.run_in_executor(None, kis.get_bulk_trans, 30)
-    cap_task = loop.run_in_executor(None, kis.get_top_market_cap, 30)
-
-    volume_list, power_list, fluct_list, bulk_list, cap_list = await asyncio.gather(
-        volume_task, power_task, fluct_task, bulk_task, cap_task
-    )
+    # 랭킹 API는 VTS에서 5xx가 자주 발생해 직렬 호출로 부하를 낮춘다.
+    volume_list = await loop.run_in_executor(None, kis.get_volume_rank, 30)
+    power_list = await loop.run_in_executor(None, kis.get_volume_power, 30)
+    fluct_list = await loop.run_in_executor(None, kis.get_fluctuation_rank, 30)
+    bulk_list = await loop.run_in_executor(None, kis.get_bulk_trans, 30)
+    cap_list = await loop.run_in_executor(None, kis.get_top_market_cap, 30)
 
     # 인덱스 매핑: ticker → 데이터
     volume_map = {s["ticker"]: s for s in volume_list}
@@ -670,8 +795,9 @@ async def _run_top5_analysis(channel: discord.abc.Messageable, trade_date: str):
         )
         try:
             ta = TradingAgentsGraph(debug=False, config=config)
+            analysis_symbol = _yf_ticker(ticker, reference_price=stock_info["price"])
             final_state, decision = await loop.run_in_executor(
-                None, ta.propagate, _yf_ticker(ticker), trade_date
+                None, ta.propagate, analysis_symbol, trade_date
             )
 
             color_map = {"BUY": 0x00FF00, "SELL": 0xFF0000, "HOLD": 0xFFAA00}
@@ -684,13 +810,32 @@ async def _run_top5_analysis(channel: discord.abc.Messageable, trade_date: str):
             )
             await progress.edit(content=None, embed=embed)
 
-            report_text = _build_report_text(final_state, ticker)
-            await channel.send(
-                file=discord.File(
-                    fp=BytesIO(report_text.encode("utf-8")),
-                    filename=f"{ticker}_{trade_date}_report.md",
-                )
+            report_text = _build_report_text(
+                final_state,
+                ticker,
+                market="KR",
+                analysis_symbol=analysis_symbol,
             )
+            report_file, report_path = _prepare_report_attachment(
+                report_text,
+                market="KR",
+                ticker=ticker,
+                trade_date=trade_date,
+                scope="TOP5",
+            )
+            if AUTO_REPORT_UPLOAD:
+                try:
+                    await channel.send(file=report_file)
+                except Exception as e:
+                    _log(
+                        "WARN",
+                        "TOP5_REPORT_UPLOAD_FAIL",
+                        f"ticker={ticker} error={str(e)[:160]} path={report_path or 'N/A'}",
+                    )
+                    await channel.send(
+                        "⚠️ 보고서 파일 업로드에 실패했습니다. "
+                        + (f"로컬 저장 파일: `{report_path}`" if report_path else "로컬 저장도 실패했습니다.")
+                    )
 
             if decision.upper() == "BUY":
                 buy_targets.append({
@@ -1011,11 +1156,25 @@ async def analyze(
         try:
             loop = asyncio.get_running_loop()
             ta = TradingAgentsGraph(debug=False, config=config)
+            analysis_ref_price = None
+            if market == "KR" and kis.is_configured:
+                try:
+                    analysis_ref_price = await loop.run_in_executor(
+                        None, kis.get_price, ticker, "KR"
+                    )
+                except Exception:
+                    analysis_ref_price = None
+            analysis_symbol = _yf_ticker(ticker, reference_price=analysis_ref_price)
             final_state, decision = await loop.run_in_executor(
-                None, ta.propagate, _yf_ticker(ticker), trade_date
+                None, ta.propagate, analysis_symbol, trade_date
             )
 
-            report_text = _build_report_text(final_state, ticker)
+            report_text = _build_report_text(
+                final_state,
+                ticker,
+                market=market,
+                analysis_symbol=analysis_symbol,
+            )
             summary = _extract_decision_summary(final_state, decision, ticker, market)
 
             color_map = {"BUY": 0x00FF00, "SELL": 0xFF0000, "HOLD": 0xFFAA00}
@@ -1029,14 +1188,28 @@ async def analyze(
 
             await status_msg.edit(content=None, embed=embed)
 
-            report_file = discord.File(
-                fp=BytesIO(report_text.encode("utf-8")),
-                filename=f"{market}_{ticker}_{trade_date}_report.md",
+            report_file, report_path = _prepare_report_attachment(
+                report_text,
+                market=market,
+                ticker=ticker,
+                trade_date=trade_date,
+                scope="SLASH",
             )
-            await interaction.followup.send(
-                f"📄 **{ticker} ({market})** 전체 보고서:",
-                file=report_file,
-            )
+            try:
+                await interaction.followup.send(
+                    f"📄 **{ticker} ({market})** 전체 보고서:",
+                    file=report_file,
+                )
+            except Exception as e:
+                _log(
+                    "WARN",
+                    "SLASH_ANALYZE_REPORT_UPLOAD_FAIL",
+                    f"ticker={ticker} error={str(e)[:160]} path={report_path or 'N/A'}",
+                )
+                await interaction.followup.send(
+                    "⚠️ 보고서 파일 업로드에 실패했습니다. "
+                    + (f"로컬 저장 파일: `{report_path}`" if report_path else "로컬 저장도 실패했습니다.")
+                )
 
             # BUY/SELL 판정 시 자동매매 버튼
             ch = interaction.channel
@@ -1619,20 +1792,19 @@ async def morning_auto_buy():
         # ── 2) 상위 후보 순차 AI 분석 → BUY만 수집 ──
         buy_targets: list[dict] = []
         analyzed_count = 0
-
-        for c in filtered:
-            if len(buy_targets) >= DAY_TRADE_PICKS:
-                break
+        analysis_candidates = filtered[:DAY_TRADE_PICKS]
+        for c in analysis_candidates:
 
             analyzed_count += 1
             progress = await channel.send(
-                f"🔍 [{analyzed_count}/{min(len(filtered), DAY_TRADE_PICKS + 2)}] "
+                f"🔍 [{analyzed_count}/{len(analysis_candidates)}] "
                 f"**{c['name']}** (`{c['ticker']}`) AI 분석 중… (약 3~5분)"
             )
             try:
                 ta = TradingAgentsGraph(debug=False, config=config)
+                analysis_symbol = _yf_ticker(c["ticker"], reference_price=c["price"])
                 final_state, decision = await loop.run_in_executor(
-                    None, ta.propagate, _yf_ticker(c["ticker"]), trade_date
+                    None, ta.propagate, analysis_symbol, trade_date
                 )
                 emoji = "🟢" if decision == "BUY" else "🔴" if decision == "SELL" else "🟡"
                 color_map = {"BUY": 0x00FF00, "SELL": 0xFF0000, "HOLD": 0xFFAA00}
@@ -1643,6 +1815,33 @@ async def morning_auto_buy():
                     color=color_map.get(decision.upper(), 0x808080),
                 )
                 await progress.edit(content=None, embed=embed)
+
+                report_text = _build_report_text(
+                    final_state,
+                    c["ticker"],
+                    market="KR",
+                    analysis_symbol=analysis_symbol,
+                )
+                report_file, report_path = _prepare_report_attachment(
+                    report_text,
+                    market="KR",
+                    ticker=c["ticker"],
+                    trade_date=trade_date,
+                    scope="AUTO_KR",
+                )
+                if AUTO_REPORT_UPLOAD:
+                    try:
+                        await channel.send(file=report_file)
+                    except Exception as e:
+                        _log(
+                            "WARN",
+                            "AUTO_BUY_REPORT_UPLOAD_FAIL",
+                            f"ticker={c['ticker']} error={str(e)[:160]} path={report_path or 'N/A'}",
+                        )
+                        await channel.send(
+                            "⚠️ 보고서 파일 업로드에 실패했습니다. "
+                            + (f"로컬 저장 파일: `{report_path}`" if report_path else "로컬 저장도 실패했습니다.")
+                        )
 
                 if decision.upper() == "BUY":
                     buy_targets.append({
@@ -1678,7 +1877,7 @@ async def morning_auto_buy():
             await channel.send("❌ 예수금이 0원입니다. 매수할 수 없습니다.")
             return
 
-        per_stock_budget = cash // len(buy_targets)
+        per_stock_budget = int(cash // len(buy_targets))
         buy_results: list[str] = []
         total_invested = 0
 
@@ -1692,7 +1891,7 @@ async def morning_auto_buy():
                 buy_results.append(f"⚠️ {target['name']} — 현재가 조회 실패")
                 continue
 
-            qty = per_stock_budget // current_price
+            qty = int(per_stock_budget // current_price)
             if qty <= 0:
                 buy_results.append(
                     f"⚠️ {target['name']} — 예산({format_krw(per_stock_budget)}) 부족"
@@ -1707,7 +1906,7 @@ async def morning_auto_buy():
                 remaining_cash = cash
 
             if qty * current_price > remaining_cash:
-                qty = remaining_cash // current_price
+                qty = int(remaining_cash // current_price)
                 if qty <= 0:
                     buy_results.append(f"⚠️ {target['name']} — 잔액 부족")
                     continue
@@ -2023,12 +2222,11 @@ async def us_morning_auto_buy():
 
         buy_targets: list[dict] = []
         analyzed_count = 0
-        for c in filtered:
-            if len(buy_targets) >= US_DAY_TRADE_PICKS:
-                break
+        analysis_candidates = filtered[:US_DAY_TRADE_PICKS]
+        for c in analysis_candidates:
             analyzed_count += 1
             progress = await channel.send(
-                f"🔍 [{analyzed_count}/{min(len(filtered), US_DAY_TRADE_PICKS + 2)}] "
+                f"🔍 [{analyzed_count}/{len(analysis_candidates)}] "
                 f"**{c['name']}** (`{c['ticker']}`) AI 분석 중…"
             )
             try:
@@ -2045,6 +2243,33 @@ async def us_morning_auto_buy():
                     color=color_map.get(decision.upper(), 0x808080),
                 )
                 await progress.edit(content=None, embed=embed)
+
+                report_text = _build_report_text(
+                    final_state,
+                    c["ticker"],
+                    market="US",
+                    analysis_symbol=c["ticker"],
+                )
+                report_file, report_path = _prepare_report_attachment(
+                    report_text,
+                    market="US",
+                    ticker=c["ticker"],
+                    trade_date=trade_date,
+                    scope="AUTO_US",
+                )
+                if AUTO_REPORT_UPLOAD:
+                    try:
+                        await channel.send(file=report_file)
+                    except Exception as e:
+                        _log(
+                            "WARN",
+                            "US_AUTO_BUY_REPORT_UPLOAD_FAIL",
+                            f"ticker={c['ticker']} error={str(e)[:160]} path={report_path or 'N/A'}",
+                        )
+                        await channel.send(
+                            "⚠️ 보고서 파일 업로드에 실패했습니다. "
+                            + (f"로컬 저장 파일: `{report_path}`" if report_path else "로컬 저장도 실패했습니다.")
+                        )
 
                 if decision.upper() == "BUY":
                     buy_targets.append(c)

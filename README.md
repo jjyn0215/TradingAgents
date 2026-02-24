@@ -223,6 +223,8 @@ US_WATCHLIST=AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD,AVGO,QQQ,SPY
 DAY_TRADE_PICKS=5                   # 매일 매수할 종목 수 (기본 5)
 AUTO_BUY_TIME=09:30                 # 자동 매수 시각 KST (기본 09:30)
 AUTO_SELL_TIME=15:20                # 자동 매도 시각 KST (기본 15:20)
+REPORTS_DIR=reports                 # 분석 보고서 저장 경로 (도커: /app/reports)
+AUTO_REPORT_UPLOAD=true             # 자동매매 분석 보고서 디스코드 업로드 여부
 
 # ─── 미국 데이 트레이딩 설정 (뉴욕시간 ET) ─────────────
 US_DAY_TRADE_PICKS=5                # 미국 자동매수 종목 수
@@ -287,6 +289,7 @@ python bot.py
 
 - 분석 완료 시 **색상 코딩된 Embed** (BUY=🟢, SELL=🔴, HOLD=🟡) 표시
 - **전체 보고서**는 `.md` 파일로 첨부
+- 보고서는 디스크에도 저장됨 (`REPORTS_DIR`, 기본 `reports/`)
 - 티커는 **시장 자동판단**: `005930`(KR), `AAPL`(US)
 - **BUY** → 매수 확인 버튼 표시 (KIS 설정 시)
 - **SELL + 해당 종목 보유 중** → 매도 확인 버튼 표시
