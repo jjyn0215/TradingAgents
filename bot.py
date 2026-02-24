@@ -1,6 +1,6 @@
 """
 TradingAgents Discord Bot
-- 슬래시 명령: /분석, /대형주, /잔고, /매수, /매도, /상태, /봇정보, /스코어링, /수익
+- 슬래시 명령: /분석, /대형주, /잔고, /매수, /매도, /상태, /봇정보, /스코어링, /스코어규칙, /수익
 - 데이 트레이딩: 아침 자동매수 / 오후 자동매도 / 손절·익절 감시
 - 한국투자증권 API 연동 매매
 """
@@ -1759,7 +1759,111 @@ async def bot_info_cmd(interaction: discord.Interaction):
 
 
 # ─── Slash Command: /스코어링 ──────────────────────────────────
-@tree.command(name="스코어링", description="자동매매 스코어링 규칙을 조회합니다")
+@tree.command(name="스코어링", description="실시간 스코어링 후보를 조회합니다")
+@app_commands.describe(
+    market="조회할 시장 (기본: KR)",
+    count="표시할 개수 (1~15, 기본 10)",
+    exclude_held="보유 종목 제외 여부 (기본: 제외)",
+)
+@app_commands.choices(
+    market=[
+        app_commands.Choice(name="한국 (KR)", value="KR"),
+        app_commands.Choice(name="미국 (US)", value="US"),
+    ]
+)
+async def scoring_cmd(
+    interaction: discord.Interaction,
+    market: app_commands.Choice[str] | None = None,
+    count: int = 10,
+    exclude_held: bool = True,
+):
+    await interaction.response.defer(thinking=True)
+    _log("INFO", "SLASH_SCORING_START", _interaction_actor(interaction))
+
+    if not _is_allowed_channel(interaction.channel_id):
+        _log("WARN", "SLASH_SCORING_BLOCKED", f"허용되지 않은 채널 channel={interaction.channel_id}")
+        await interaction.followup.send("❌ 이 채널에서는 사용할 수 없습니다.")
+        return
+
+    if count < 1 or count > 15:
+        await interaction.followup.send("❌ count는 1~15 범위로 입력해주세요.")
+        return
+
+    selected = market.value if market else "KR"
+    title_market = {"KR": "한국", "US": "미국"}.get(selected, "한국")
+    mode_label = "🧪 모의투자" if kis.virtual else "💰 실전투자"
+    loop = asyncio.get_running_loop()
+
+    if selected == "KR" and not kis.is_configured:
+        await interaction.followup.send(
+            "⚠️ KR 스코어링은 KIS API 설정이 필요합니다. `.env`를 확인해주세요."
+        )
+        return
+
+    status = await interaction.followup.send(
+        f"📊 {title_market} 실시간 스코어링 실행 중…",
+        wait=True,
+    )
+
+    # 보유 종목 제외를 켜도 count를 채우기 위해 여유분을 더 조회한다.
+    request_count = max(10, count * 2) if exclude_held else max(10, count)
+    try:
+        if selected == "KR":
+            candidates = await _compute_stock_scores(count=request_count)
+        else:
+            candidates = await _compute_us_stock_scores(count=request_count)
+    except Exception as e:
+        _log("ERROR", "SLASH_SCORING_ERROR", f"market={selected} error={str(e)[:200]}")
+        await status.edit(content=f"❌ 스코어링 실행 실패: {str(e)[:300]}")
+        return
+
+    if not candidates:
+        await status.edit(content=f"❌ {title_market} 스코어링 후보가 없습니다.")
+        return
+
+    filtered = candidates
+    held_tickers: set[str] = set()
+    if exclude_held and kis.is_configured:
+        try:
+            balance_data = await loop.run_in_executor(None, kis.get_balance, selected)
+            held_tickers = {h["ticker"] for h in balance_data.get("holdings", [])}
+            filtered = [c for c in candidates if c["ticker"] not in held_tickers]
+        except Exception as e:
+            _log("WARN", "SLASH_SCORING_HELD_FETCH_FAIL", f"market={selected} error={str(e)[:160]}")
+            filtered = candidates
+
+    if not filtered:
+        await status.edit(content="📋 후보 종목이 모두 이미 보유 중입니다.")
+        return
+
+    top_list = filtered[:count]
+    currency = "USD" if selected == "US" else "KRW"
+    lines = []
+    for idx, c in enumerate(top_list, 1):
+        sig_str = ", ".join(c.get("signals", []))
+        lines.append(
+            f"**{idx}. {c['name']} (`{c['ticker']}`)** — **{c['score']}점**\n"
+            f"{_format_money(c.get('price', 0), currency)} ({float(c.get('prdy_ctrt', 0)):+.2f}%) | {sig_str}"
+        )
+
+    embed = discord.Embed(
+        title=f"🏆 {title_market} 실시간 스코어링 TOP {len(top_list)}",
+        description="\n".join(lines),
+        color=0x0066FF,
+        timestamp=datetime.datetime.now(NY_TZ if selected == "US" else KST),
+    )
+    held_note = f"ON ({len(held_tickers)}개 제외)" if exclude_held else "OFF"
+    embed.set_footer(text=f"{mode_label} | 보유 제외: {held_note}")
+    await status.edit(content=None, embed=embed)
+    _log(
+        "INFO",
+        "SLASH_SCORING_DONE",
+        f"market={selected} requested={request_count} shown={len(top_list)} exclude_held={exclude_held}",
+    )
+
+
+# ─── Slash Command: /스코어규칙 ─────────────────────────────────
+@tree.command(name="스코어규칙", description="자동매매 스코어링 규칙을 조회합니다")
 @app_commands.describe(market="조회할 시장 (기본: 전체)")
 @app_commands.choices(
     market=[
@@ -1773,10 +1877,10 @@ async def scoring_rules_cmd(
     market: app_commands.Choice[str] | None = None,
 ):
     await interaction.response.defer(thinking=True)
-    _log("INFO", "SLASH_SCORING_START", _interaction_actor(interaction))
+    _log("INFO", "SLASH_SCORING_RULES_START", _interaction_actor(interaction))
 
     if not _is_allowed_channel(interaction.channel_id):
-        _log("WARN", "SLASH_SCORING_BLOCKED", f"허용되지 않은 채널 channel={interaction.channel_id}")
+        _log("WARN", "SLASH_SCORING_RULES_BLOCKED", f"허용되지 않은 채널 channel={interaction.channel_id}")
         await interaction.followup.send("❌ 이 채널에서는 사용할 수 없습니다.")
         return
 
@@ -1825,9 +1929,9 @@ async def scoring_rules_cmd(
             inline=False,
         )
 
-    embed.set_footer(text=f"{mode_label} | /스코어링")
+    embed.set_footer(text=f"{mode_label} | /스코어규칙")
     await interaction.followup.send(embed=embed)
-    _log("INFO", "SLASH_SCORING_DONE", f"market={selected}")
+    _log("INFO", "SLASH_SCORING_RULES_DONE", f"market={selected}")
 
 
 # ─── Slash Command: /수익 ──────────────────────────────────────
@@ -2881,7 +2985,7 @@ async def on_ready():
     print(f"✅ {bot.user} 로그인 완료!")
     print(f"   서버 수: {len(bot.guilds)}")
     print(f"   동기화된 슬래시 명령 수: {len(synced)}")
-    print("   슬래시 명령: /분석, /대형주, /잔고, /매수, /매도, /상태, /봇정보, /스코어링, /수익")
+    print("   슬래시 명령: /분석, /대형주, /잔고, /매수, /매도, /상태, /봇정보, /스코어링, /스코어규칙, /수익")
     print(f"   KIS: {'✅ 설정됨' if kis.is_configured else '❌ 미설정'}")
     print(f"   모드: {'🧪 모의투자' if kis.virtual else '💰 실전투자'}")
     print(f"   KR 데이 트레이딩: 매수 {AUTO_BUY_TIME} / 매도 {AUTO_SELL_TIME} KST")
