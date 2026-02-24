@@ -163,8 +163,64 @@ class KISClient:
             resp = requests.get(url, headers=self._headers(tr_id), params=params, timeout=timeout)
         else:
             resp = requests.post(url, headers=self._headers(tr_id), json=json_data, timeout=timeout)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # KIS는 5xx에서도 JSON 본문(msg_cd/msg1)을 내려주는 경우가 있어 에러 메시지에 포함한다.
+            detail = ""
+            try:
+                body = resp.json()
+                if isinstance(body, dict):
+                    rt_cd = body.get("rt_cd", "")
+                    msg_cd = body.get("msg_cd", "")
+                    msg1 = body.get("msg1", "") or body.get("message", "")
+                    detail = f"rt_cd={rt_cd} msg_cd={msg_cd} msg1={msg1}"
+                else:
+                    detail = str(body)[:240]
+            except Exception:
+                detail = (resp.text or "").strip().replace("\n", " ")[:240]
+            raise requests.HTTPError(
+                f"HTTP {resp.status_code} {method.upper()} {url} {detail}".strip(),
+                response=resp,
+            )
         return resp.json()
+
+    def _request_with_retry(
+        self,
+        method: str,
+        path: str,
+        tr_id: str,
+        *,
+        params: dict | None = None,
+        json_data: dict | None = None,
+        timeout: int = 10,
+        retries: int = 1,
+        base_delay_sec: float = 0.4,
+    ) -> dict:
+        """주문/중요 API용 재시도 래퍼 (5xx/429/네트워크 오류 대상)."""
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return self._request(
+                    method,
+                    path,
+                    tr_id,
+                    params=params,
+                    json_data=json_data,
+                    timeout=timeout,
+                )
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                last_error = e
+                if status is not None and status < 500 and status != 429:
+                    raise
+            except Exception as e:
+                last_error = e
+
+            if attempt < retries:
+                time.sleep(base_delay_sec * (attempt + 1))
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"request failed: {path}")
 
     def _ranking_request(
         self,
@@ -568,33 +624,74 @@ class KISClient:
         return self._order_kr("SELL", t, qty, price)
 
     def _order_kr(self, side: Literal["BUY", "SELL"], ticker: str, qty: int, price: float = 0) -> dict:
-        tr_id = "VTTC0012U" if side == "BUY" and self.virtual else "TTTC0012U"
+        primary_tr_id = "VTTC0012U" if side == "BUY" and self.virtual else "TTTC0012U"
         if side == "SELL":
-            tr_id = "VTTC0011U" if self.virtual else "TTTC0011U"
+            primary_tr_id = "VTTC0011U" if self.virtual else "TTTC0011U"
+        fallback_tr_id = "VTTC0802U" if side == "BUY" and self.virtual else "TTTC0802U"
+        if side == "SELL":
+            fallback_tr_id = "VTTC0801U" if self.virtual else "TTTC0801U"
+
         qty_int = int(qty)
         excg_id_dvsn_cd = os.getenv("KIS_KR_EXCHANGE_ID", "KRX")
         sll_type = "00" if side == "SELL" else ""
 
-        data = self._request(
-            "POST",
-            "/uapi/domestic-stock/v1/trading/order-cash",
-            tr_id,
-            json_data={
-                "CANO": self.cano,
-                "ACNT_PRDT_CD": self.acnt_prdt_cd,
-                "PDNO": ticker,
-                "EXCG_ID_DVSN_CD": excg_id_dvsn_cd,
-                "ORD_DVSN": "01",  # 시장가
-                "ORD_QTY": str(qty_int),
-                "ORD_UNPR": str(int(price)) if price else "0",
-                "SLL_TYPE": sll_type,
-                "CNDT_PRIC": "",
-            },
-        )
+        primary_payload = {
+            "CANO": self.cano,
+            "ACNT_PRDT_CD": self.acnt_prdt_cd,
+            "PDNO": ticker,
+            "EXCG_ID_DVSN_CD": excg_id_dvsn_cd,
+            "ORD_DVSN": "01",  # 시장가
+            "ORD_QTY": str(qty_int),
+            "ORD_UNPR": str(int(price)) if price else "0",
+            "SLL_TYPE": sll_type,
+            "CNDT_PRIC": "",
+        }
+        # 일부 계정/문서 버전 호환용 최소 페이로드 fallback
+        fallback_payload = {
+            "CANO": self.cano,
+            "ACNT_PRDT_CD": self.acnt_prdt_cd,
+            "PDNO": ticker,
+            "ORD_DVSN": "01",  # 시장가
+            "ORD_QTY": str(qty_int),
+            "ORD_UNPR": str(int(price)) if price else "0",
+        }
+
+        attempts = [("primary", primary_tr_id, primary_payload)]
+        if fallback_tr_id != primary_tr_id:
+            attempts.append(("fallback", fallback_tr_id, fallback_payload))
+
+        errors: list[str] = []
+        for mode, tr_id, payload in attempts:
+            try:
+                data = self._request_with_retry(
+                    "POST",
+                    "/uapi/domestic-stock/v1/trading/order-cash",
+                    tr_id,
+                    json_data=payload,
+                    retries=1,
+                )
+                return {
+                    "success": data.get("rt_cd") == "0",
+                    "message": data.get("msg1", ""),
+                    "order_no": data.get("output", {}).get("ODNO", ""),
+                    "market": "KR",
+                    "currency": "KRW",
+                    "exchange": "KRX",
+                }
+            except Exception as e:
+                logger.warning(
+                    "국내 주문 실패 (%s) ticker=%s tr_id=%s: %s",
+                    mode,
+                    ticker,
+                    tr_id,
+                    e,
+                )
+                errors.append(f"{mode}:{str(e)}")
+
         return {
-            "success": data.get("rt_cd") == "0",
-            "message": data.get("msg1", ""),
-            "order_no": data.get("output", {}).get("ODNO", ""),
+            "success": False,
+            "message": " | ".join(errors)[:300] if errors else "국내 주문 실패",
+            "order_no": "",
             "market": "KR",
             "currency": "KRW",
             "exchange": "KRX",
@@ -635,7 +732,7 @@ class KISClient:
         sll_type = "00" if side == "SELL" else ""
 
         try:
-            data = self._request(
+            data = self._request_with_retry(
                 "POST",
                 path,
                 tr_id,
@@ -652,6 +749,7 @@ class KISClient:
                     "CTAC_TLNO": "",
                     "MGCO_APTM_ODNO": "",
                 },
+                retries=1,
             )
             return {
                 "success": data.get("rt_cd") == "0",

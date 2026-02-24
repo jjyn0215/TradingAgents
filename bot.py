@@ -2246,10 +2246,10 @@ async def morning_auto_buy():
                     )
                 else:
                     buy_results.append(
-                        f"❌ {target['name']} 매수실패: {result['message'][:100]}"
+                        f"❌ {target['name']} 매수실패: {result['message'][:180]}"
                     )
             except Exception as e:
-                buy_results.append(f"❌ {target['name']} 매수오류: {str(e)[:100]}")
+                buy_results.append(f"❌ {target['name']} 매수오류: {str(e)[:180]}")
 
         # ── 결과 임베드 ──
         result_embed = discord.Embed(
@@ -2661,9 +2661,9 @@ async def us_morning_auto_buy():
                         f"{qty}주 × {_format_money(current_price, 'USD')} = {_format_money(amount, 'USD')}"
                     )
                 else:
-                    buy_results.append(f"❌ {target['name']} 매수실패: {result['message'][:100]}")
+                    buy_results.append(f"❌ {target['name']} 매수실패: {result['message'][:180]}")
             except Exception as e:
-                buy_results.append(f"❌ {target['name']} 매수오류: {str(e)[:100]}")
+                buy_results.append(f"❌ {target['name']} 매수오류: {str(e)[:180]}")
 
         result_embed = discord.Embed(
             title=f"🇺🇸🌅 자동매수 결과 ({len(buy_targets)}종목)",
