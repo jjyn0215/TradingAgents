@@ -1,6 +1,6 @@
 """
 TradingAgents Discord Bot
-- 슬래시 명령: /분석, /대형주, /잔고, /매도, /상태, /봇정보, /수익
+- 슬래시 명령: /분석, /대형주, /잔고, /매수, /매도, /상태, /봇정보, /스코어링, /수익
 - 데이 트레이딩: 아침 자동매수 / 오후 자동매도 / 손절·익절 감시
 - 한국투자증권 API 연동 매매
 """
@@ -962,6 +962,7 @@ class BuyConfirmView(discord.ui.View):
         price: float,
         market: str = "KR",
         currency: str = "KRW",
+        reason: str = "AI BUY 신호",
     ):
         super().__init__(timeout=300)
         self.ticker = ticker
@@ -970,6 +971,7 @@ class BuyConfirmView(discord.ui.View):
         self.price = float(price)
         self.market = market.upper()
         self.currency = currency.upper()
+        self.reason = reason
 
     @discord.ui.button(label="✅ 매수 확인", style=discord.ButtonStyle.green)
     async def confirm_buy(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -984,7 +986,7 @@ class BuyConfirmView(discord.ui.View):
                     self.ticker, self.name, "BUY",
                     self.qty, self.price,
                     order_no=result.get("order_no", ""),
-                    reason="AI BUY 신호",
+                    reason=self.reason,
                     market=self.market,
                     currency=self.currency,
                 )
@@ -1337,6 +1339,142 @@ async def balance_cmd(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ 잔고 조회 실패: {str(e)[:500]}")
 
 
+# ─── Slash Command: /매수 ──────────────────────────────────────
+@tree.command(name="매수", description="종목을 매수합니다 (수량 생략 시 예산 상한 기준 자동 계산)")
+@app_commands.describe(
+    ticker="매수할 종목 코드 (예: 005930, AAPL)",
+    qty="매수 수량 (생략 시 시장별 수동 예산 상한 기준)",
+)
+async def buy_cmd(
+    interaction: discord.Interaction,
+    ticker: str,
+    qty: int | None = None,
+):
+    await interaction.response.defer(thinking=True)
+    _log("INFO", "SLASH_BUY_START", f"{_interaction_actor(interaction)} ticker={ticker} qty={qty}")
+
+    if not _is_allowed_channel(interaction.channel_id):
+        _log("WARN", "SLASH_BUY_BLOCKED", f"허용되지 않은 채널 channel={interaction.channel_id}")
+        await interaction.followup.send("❌ 이 채널에서는 사용할 수 없습니다.")
+        return
+
+    if not kis.is_configured:
+        _log("WARN", "SLASH_BUY_BLOCKED", "KIS API not configured")
+        await interaction.followup.send("⚠️ KIS API가 설정되지 않았습니다.")
+        return
+
+    ticker = ticker.strip().upper()
+    format_error = _validate_ticker_format(ticker)
+    if format_error:
+        _log("WARN", "SLASH_BUY_INVALID_TICKER", f"ticker={ticker} reason={format_error}")
+        await interaction.followup.send(f"❌ {format_error}")
+        return
+
+    market = _market_of_ticker(ticker)
+    if market == "US" and not kis.enable_us_trading:
+        _log("WARN", "SLASH_BUY_US_DISABLED", f"ticker={ticker}")
+        await interaction.followup.send(
+            "ℹ️ 미국 주문은 비활성화되어 있습니다. `.env`의 "
+            "`ENABLE_US_TRADING=true` 설정 후 사용하세요."
+        )
+        return
+
+    if qty is not None and qty <= 0:
+        _log("WARN", "SLASH_BUY_INVALID_QTY", f"ticker={ticker} qty={qty}")
+        await interaction.followup.send("❌ 수량은 1 이상이어야 합니다.")
+        return
+
+    if not _is_market_open_now(market):
+        _log("INFO", "SLASH_BUY_MARKET_CLOSED", f"market={market} ticker={ticker}")
+        await interaction.followup.send(
+            f"ℹ️ `{ticker}`({market}) 현재 장외/휴장 상태라 주문 버튼을 표시하지 않습니다."
+        )
+        return
+
+    normalized = kis.normalize_ticker(ticker, market)
+    currency = _currency_of_market(market)
+    budget_cap = kis.us_max_order_amount if market == "US" else kis.max_order_amount
+    loop = asyncio.get_running_loop()
+
+    try:
+        price = await loop.run_in_executor(None, kis.get_price, normalized, market)
+    except Exception as e:
+        _log("ERROR", "SLASH_BUY_PRICE_ERROR", f"ticker={normalized} error={str(e)[:200]}")
+        await interaction.followup.send(f"❌ 현재가 조회 실패: {str(e)[:300]}")
+        return
+
+    if price <= 0:
+        _log("WARN", "SLASH_BUY_INVALID_PRICE", f"market={market} ticker={normalized} price={price}")
+        await interaction.followup.send(
+            f"❌ `{normalized}`({market}) 현재가를 확인할 수 없습니다. 티커를 다시 확인해주세요."
+        )
+        return
+
+    auto_qty = False
+    buy_qty = qty
+    if buy_qty is None:
+        auto_qty = True
+        buy_qty = int(budget_cap // price)
+        if buy_qty <= 0:
+            _log("WARN", "SLASH_BUY_BUDGET_TOO_LOW", f"market={market} ticker={normalized} price={price}")
+            await interaction.followup.send(
+                f"⚠️ 예산 상한({_format_money(budget_cap, currency)}) 대비 "
+                f"현재가({_format_money(price, currency)})가 높아 1주도 매수할 수 없습니다."
+            )
+            return
+
+    expected_amount = buy_qty * price
+    if expected_amount > budget_cap:
+        _log(
+            "WARN",
+            "SLASH_BUY_OVER_CAP",
+            f"market={market} ticker={normalized} qty={buy_qty} amount={expected_amount} cap={budget_cap}",
+        )
+        await interaction.followup.send(
+            f"❌ 주문 예상금액({_format_money(expected_amount, currency)})이 "
+            f"수동 예산 상한({_format_money(budget_cap, currency)})을 초과합니다.\n"
+            "수량을 줄이거나 예산 상한 환경변수를 조정하세요."
+        )
+        return
+
+    view = BuyConfirmView(
+        ticker=normalized,
+        name=normalized,
+        qty=buy_qty,
+        price=price,
+        market=market,
+        currency=currency,
+        reason="수동 /매수 주문",
+    )
+    mode_label = "🧪 모의투자" if kis.virtual else "💰 실전투자"
+    qty_rule_text = (
+        f"자동 계산(상한 {_format_money(budget_cap, currency)} 기준)"
+        if auto_qty
+        else f"사용자 입력 ({buy_qty}주)"
+    )
+    embed = discord.Embed(
+        title="🛒 매수 확인",
+        description=(
+            f"**시장:** {market}\n"
+            f"**종목:** `{normalized}`\n"
+            f"**현재가:** {_format_money(price, currency)}\n"
+            f"**매수 수량:** {buy_qty}주\n"
+            f"**수량 기준:** {qty_rule_text}\n"
+            f"**예상 금액:** {_format_money(expected_amount, currency)}\n"
+            f"**수동 예산 상한:** {_format_money(budget_cap, currency)}\n\n"
+            f"매수하시겠습니까?"
+        ),
+        color=0x00FF00,
+    )
+    embed.set_footer(text=f"{mode_label} | {currency}")
+    await interaction.followup.send(embed=embed, view=view)
+    _log(
+        "INFO",
+        "SLASH_BUY_PROMPT",
+        f"market={market} ticker={normalized} qty={buy_qty} price={price}",
+    )
+
+
 # ─── Slash Command: /매도 ──────────────────────────────────────
 @tree.command(name="매도", description="보유 종목을 매도합니다 (수량 생략 시 전량 매도)")
 @app_commands.describe(
@@ -1618,6 +1756,78 @@ async def bot_info_cmd(interaction: discord.Interaction):
         "SLASH_BOTINFO_DONE",
         f"kr_open={kr_market_open} us_open={us_market_open} state_count={len(states)}",
     )
+
+
+# ─── Slash Command: /스코어링 ──────────────────────────────────
+@tree.command(name="스코어링", description="자동매매 스코어링 규칙을 조회합니다")
+@app_commands.describe(market="조회할 시장 (기본: 전체)")
+@app_commands.choices(
+    market=[
+        app_commands.Choice(name="전체", value="ALL"),
+        app_commands.Choice(name="한국 (KR)", value="KR"),
+        app_commands.Choice(name="미국 (US)", value="US"),
+    ]
+)
+async def scoring_rules_cmd(
+    interaction: discord.Interaction,
+    market: app_commands.Choice[str] | None = None,
+):
+    await interaction.response.defer(thinking=True)
+    _log("INFO", "SLASH_SCORING_START", _interaction_actor(interaction))
+
+    if not _is_allowed_channel(interaction.channel_id):
+        _log("WARN", "SLASH_SCORING_BLOCKED", f"허용되지 않은 채널 channel={interaction.channel_id}")
+        await interaction.followup.send("❌ 이 채널에서는 사용할 수 없습니다.")
+        return
+
+    selected = market.value if market else "ALL"
+    title_market = {"ALL": "전체", "KR": "한국", "US": "미국"}.get(selected, "전체")
+    mode_label = "🧪 모의투자" if kis.virtual else "💰 실전투자"
+
+    embed = discord.Embed(
+        title=f"📐 스코어링 규칙 ({title_market})",
+        description=(
+            "자동매매는 **룰 기반 스코어링 → 상위 후보만 AI 분석** 순서로 동작합니다.\n"
+            "아래 점수는 현재 코드 기준 고정 규칙입니다."
+        ),
+        color=0x0066FF,
+        timestamp=datetime.datetime.now(),
+    )
+
+    if selected in ("ALL", "KR"):
+        embed.add_field(
+            name="🇰🇷 KR 점수식",
+            value=(
+                "데이터 소스: 거래량/체결강도/등락률/대량체결/시가총액 랭킹 (각 TOP30)\n"
+                "• 거래량 랭크 진입: `+10`\n"
+                "• 체결강도 `>=120`: `+25`, `>=100`: `+15`\n"
+                "• 등락률 `0~3%`: `+20`, `3~7%`: `+10`\n"
+                "• 대량체결 랭크 진입: `+15`\n"
+                "• 시총 랭크 진입: `+5`\n"
+                "필터: 등락률 `>10%` 또는 `<-3%` 제외\n"
+                f"후보 생성: TOP `10` → AI 분석: 상위 `{DAY_TRADE_PICKS}`개"
+            ),
+            inline=False,
+        )
+
+    if selected in ("ALL", "US"):
+        us_status = "활성" if ENABLE_US_TRADING else "비활성"
+        embed.add_field(
+            name="🇺🇸 US 점수식",
+            value=(
+                "1순위: KIS 해외 랭킹(거래량) / 실패 시 yfinance 워치리스트 폴백\n"
+                "• 등락률 `0~5%`: `+25`, `>5%`: `+10`\n"
+                "• 거래량 `>=5,000,000`: `+20`, `>=1,000,000`: `+10`\n"
+                "필터: 등락률 `<-3%` 제외\n"
+                f"후보 생성: TOP `max(10, {US_DAY_TRADE_PICKS}*2)` → AI 분석: 상위 `{US_DAY_TRADE_PICKS}`개\n"
+                f"현재 US 자동매매: **{us_status}** (`ENABLE_US_TRADING={str(ENABLE_US_TRADING).lower()}`)"
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(text=f"{mode_label} | /스코어링")
+    await interaction.followup.send(embed=embed)
+    _log("INFO", "SLASH_SCORING_DONE", f"market={selected}")
 
 
 # ─── Slash Command: /수익 ──────────────────────────────────────
@@ -2671,7 +2881,7 @@ async def on_ready():
     print(f"✅ {bot.user} 로그인 완료!")
     print(f"   서버 수: {len(bot.guilds)}")
     print(f"   동기화된 슬래시 명령 수: {len(synced)}")
-    print("   슬래시 명령: /분석, /대형주, /잔고, /매도, /상태, /봇정보, /수익")
+    print("   슬래시 명령: /분석, /대형주, /잔고, /매수, /매도, /상태, /봇정보, /스코어링, /수익")
     print(f"   KIS: {'✅ 설정됨' if kis.is_configured else '❌ 미설정'}")
     print(f"   모드: {'🧪 모의투자' if kis.virtual else '💰 실전투자'}")
     print(f"   KR 데이 트레이딩: 매수 {AUTO_BUY_TIME} / 매도 {AUTO_SELL_TIME} KST")
