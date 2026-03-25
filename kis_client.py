@@ -35,6 +35,20 @@ def _to_int(value: Any) -> int:
     return int(_to_float(value))
 
 
+def _pick_first_numeric(data: dict[str, Any], candidates: list[str]) -> tuple[float | None, str | None]:
+    for key in candidates:
+        if key in data:
+            return _to_float(data.get(key, 0)), key
+    return None, None
+
+
+def _sum_first_present_numeric(items: list[dict[str, Any]], candidates: list[str]) -> tuple[float | None, str | None]:
+    for key in candidates:
+        if any(key in item for item in items):
+            return sum(_to_float(item.get(key, 0)) for item in items), key
+    return None, None
+
+
 class KISClient:
     """한국투자증권 Open API 래퍼 (REST 직접 호출)."""
 
@@ -435,6 +449,128 @@ class KISClient:
             }
 
         return {"holdings": holdings, "summary": summary}
+
+    def get_kr_realized_pnl(self, *, include_cost: bool = True) -> dict:
+        """국내 실현손익 요약 조회.
+
+        한국투자 공식 `주식잔고조회_실현손익[v1_국내주식-041]`를 우선 사용한다.
+        모의투자에서 미지원이면 available=False로 반환하고 호출측이 fallback 하도록 한다.
+        """
+        if self.virtual:
+            return {
+                "available": False,
+                "reason": "모의투자에서는 KIS 주식잔고조회_실현손익 API를 지원하지 않습니다.",
+                "source": "KIS v1_국내주식-041",
+            }
+
+        path = "/uapi/domestic-stock/v1/trading/inquire-balance-rlz-pl"
+        tr_id = "TTTC8494R"
+
+        try:
+            data = self._request(
+                "GET",
+                path,
+                tr_id,
+                params={
+                    "CANO": self.cano,
+                    "ACNT_PRDT_CD": self.acnt_prdt_cd,
+                    "AFHR_FLPR_YN": "N",
+                    "OFL_YN": "",
+                    "INQR_DVSN": "00",
+                    "UNPR_DVSN": "01",
+                    "FUND_STTL_ICLD_YN": "N",
+                    "FNCG_AMT_AUTO_RDPT_YN": "N",
+                    "PRCS_DVSN": "00",
+                    "COST_ICLD_YN": "Y" if include_cost else "N",
+                    "CTX_AREA_FK100": "",
+                    "CTX_AREA_NK100": "",
+                },
+            )
+        except Exception as e:
+            logger.warning("KIS 국내 실현손익 조회 실패: %s", e)
+            return {
+                "available": False,
+                "reason": str(e)[:180],
+                "source": "KIS v1_국내주식-041",
+            }
+
+        items = data.get("output1", [])
+        if isinstance(items, dict):
+            items = [items]
+        summary_rows = data.get("output2", [])
+        if isinstance(summary_rows, list):
+            summary_raw = summary_rows[0] if summary_rows else {}
+        elif isinstance(summary_rows, dict):
+            summary_raw = summary_rows
+        else:
+            summary_raw = {}
+
+        total_pnl, pnl_key = _pick_first_numeric(
+            summary_raw,
+            [
+                "tot_rlzt_pfls",
+                "tot_rlzt_pfls_amt",
+                "rlzt_pfls_tot_amt",
+                "rlzt_pfls_amt",
+                "sll_buy_dif_amt_smtl",
+                "trad_pfls_smtl_amt",
+            ],
+        )
+        if total_pnl is None:
+            total_pnl, pnl_key = _sum_first_present_numeric(
+                items,
+                [
+                    "rlzt_pfls_amt",
+                    "trad_pfls_amt",
+                    "sll_buy_dif_amt",
+                    "evlu_pfls_amt",
+                ],
+            )
+        if total_pnl is None:
+            total_pnl = 0.0
+
+        fee_total, fee_key = _pick_first_numeric(
+            summary_raw,
+            [
+                "fee_smtl_amt",
+                "tot_fee_amt",
+                "smtl_fee_amt",
+                "fee_amt",
+            ],
+        )
+        if fee_total is None:
+            fee_total, fee_key = _sum_first_present_numeric(
+                items,
+                ["fee_amt", "fee"],
+            )
+
+        tax_total, tax_key = _pick_first_numeric(
+            summary_raw,
+            [
+                "tax_smtl_amt",
+                "tot_tax_amt",
+                "smtl_tax_amt",
+                "tax_amt",
+            ],
+        )
+        if tax_total is None:
+            tax_total, tax_key = _sum_first_present_numeric(
+                items,
+                ["tax_amt", "tax"],
+            )
+
+        return {
+            "available": True,
+            "source": "KIS v1_국내주식-041",
+            "include_cost": include_cost,
+            "total_pnl": float(total_pnl),
+            "fee_total": float(fee_total or 0.0),
+            "tax_total": float(tax_total or 0.0),
+            "row_count": len(items),
+            "pnl_field": pnl_key,
+            "fee_field": fee_key,
+            "tax_field": tax_key,
+        }
 
     def _get_us_balance(self) -> dict:
         """미국 주식 잔고 조회 (거래소별 합산)."""

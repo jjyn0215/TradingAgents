@@ -467,6 +467,34 @@ def _compute_auto_buy_budget(market: str, available_cash: float) -> dict[str, fl
     }
 
 
+def _select_affordable_candidates(
+    candidates: list[dict],
+    daily_budget: float,
+    max_picks: int,
+) -> tuple[list[dict], float]:
+    """균등 예산 기준으로 최소 1주 매수 가능한 후보만 고른다.
+
+    점수순 후보 목록을 입력받아, 최대 `max_picks`개까지
+    `종목당 예산 = daily_budget / 선택 종목 수` 기준으로 1주 이상 살 수 있는
+    가장 큰 후보 집합을 반환한다.
+    """
+    ranked = [c for c in candidates if float(c.get("price", 0) or 0) > 0]
+    if daily_budget <= 0 or max_picks <= 0 or not ranked:
+        return [], 0.0
+
+    max_slots = min(max_picks, len(ranked))
+    for slot_count in range(max_slots, 0, -1):
+        per_stock_budget = float(daily_budget) / slot_count
+        selected: list[dict] = []
+        for candidate in ranked:
+            if float(candidate.get("price", 0) or 0) <= per_stock_budget:
+                selected.append(candidate)
+                if len(selected) == slot_count:
+                    return selected, per_stock_budget
+
+    return [], 0.0
+
+
 # ─── Helper: 보고서 생성 ──────────────────────────────────────
 def _build_report_text(
     final_state: dict,
@@ -2107,6 +2135,7 @@ async def pnl_cmd(interaction: discord.Interaction):
         await interaction.followup.send("❌ 이 채널에서는 사용할 수 없습니다.")
         return
 
+    loop = asyncio.get_running_loop()
     by_ccy = get_total_pnl_by_currency()
     krw = by_ccy.get("KRW", get_total_pnl(currency="KRW"))
     usd = by_ccy.get("USD", get_total_pnl(currency="USD"))
@@ -2114,11 +2143,22 @@ async def pnl_cmd(interaction: discord.Interaction):
     ticker_usd = get_ticker_summary(currency="USD")
     recent_krw = get_recent_pnl(5, currency="KRW")
     recent_usd = get_recent_pnl(5, currency="USD")
+    kr_official: dict | None = None
+
+    if kis.is_configured:
+        try:
+            kr_official = await loop.run_in_executor(None, kis.get_kr_realized_pnl)
+        except Exception as e:
+            kr_official = {
+                "available": False,
+                "reason": str(e)[:180],
+                "source": "KIS v1_국내주식-041",
+            }
 
     desc_lines = [
-        f"KRW 손익: {_format_money(krw['total_pnl'], 'KRW')} | "
+        f"KRW 손익(로컬): {_format_money(krw['total_pnl'], 'KRW')} | "
         f"거래 {krw['trade_count']}회 | 승률 {krw['win_rate']}%",
-        f"USD 손익: {_format_money(usd['total_pnl'], 'USD')} | "
+        f"USD 손익(로컬): {_format_money(usd['total_pnl'], 'USD')} | "
         f"거래 {usd['trade_count']}회 | 승률 {usd['win_rate']}%",
     ]
 
@@ -2150,6 +2190,30 @@ async def pnl_cmd(interaction: discord.Interaction):
             )
         embed.add_field(name="🌎 USD 종목별", value="\n".join(lines), inline=False)
 
+    if kr_official:
+        if kr_official.get("available"):
+            official_lines = [
+                f"실현손익(비용포함): {_format_money(kr_official.get('total_pnl', 0), 'KRW')}",
+                f"조회 건수: {kr_official.get('row_count', 0)}건",
+                "출처: KIS 주식잔고조회_실현손익",
+            ]
+            fee_total = float(kr_official.get("fee_total", 0) or 0)
+            tax_total = float(kr_official.get("tax_total", 0) or 0)
+            if fee_total > 0 or tax_total > 0:
+                official_lines.append(
+                    f"파싱된 비용: 수수료 {_format_money(fee_total, 'KRW')} / 세금 {_format_money(tax_total, 'KRW')}"
+                )
+            embed.add_field(name="🏦 KR 공식 손익", value="\n".join(official_lines), inline=False)
+        else:
+            embed.add_field(
+                name="🏦 KR 공식 손익",
+                value=(
+                    "공식 실현손익 API를 사용하지 못해 현재 KRW 손익은 로컬 매매 이력 기준입니다.\n"
+                    f"사유: {kr_official.get('reason', '조회 실패')}"
+                ),
+                inline=False,
+            )
+
     if recent_krw:
         lines = []
         for r in recent_krw[:3]:
@@ -2170,7 +2234,7 @@ async def pnl_cmd(interaction: discord.Interaction):
             )
         embed.add_field(name="🕗 최근 USD 손익", value="\n".join(lines), inline=False)
 
-    embed.set_footer(text="TradingAgents 매매 이력 (통화 분리, 마지막 초기화 이후 기준)")
+    embed.set_footer(text="로컬 손익은 마지막 초기화 이후 기준이며, KR 공식 손익은 KIS 응답 가능 시 함께 표시됩니다")
     await interaction.followup.send(embed=embed)
     _log(
         "INFO",
@@ -2286,10 +2350,12 @@ async def morning_auto_buy():
             await scoring_msg.edit(content="❌ 매수 후보가 없습니다. (시장 상황 부적합)")
             return
 
-        # 이미 보유 중인 종목 제외
+        # 이미 보유 중인 종목 제외 + 현재 예산 확인
+        cash = 0.0
         try:
             balance_data = await loop.run_in_executor(None, kis.get_balance, "KR")
             held_tickers = {h["ticker"] for h in balance_data.get("holdings", [])}
+            cash = float(balance_data.get("summary", {}).get("cash", 0) or 0)
         except Exception:
             held_tickers = set()
 
@@ -2301,26 +2367,63 @@ async def morning_auto_buy():
 
         _log("INFO", "AUTO_BUY_CANDIDATES", f"raw={len(candidates)} filtered={len(filtered)}")
 
+        budget_info = _compute_auto_buy_budget("KR", cash)
+        daily_budget = int(budget_info["usable_budget"])
+        if daily_budget <= 0:
+            _log("WARN", "AUTO_BUY_NO_BUDGET", f"cash={cash} ratio={budget_info['ratio']}")
+            await scoring_msg.edit(content="❌ 오늘 사용할 자동매수 예산이 0원이라 후보 분석을 건너뜁니다.")
+            return
+
+        analysis_candidates, preview_per_stock_budget = _select_affordable_candidates(
+            filtered,
+            daily_budget,
+            DAY_TRADE_PICKS,
+        )
+        if not analysis_candidates:
+            _log("WARN", "AUTO_BUY_NO_AFFORDABLE", f"filtered={len(filtered)} daily_budget={daily_budget}")
+            await scoring_msg.edit(
+                content=(
+                    "❌ 오늘 예산으로는 1주 이상 매수 가능한 KR 후보가 없습니다.\n"
+                    f"오늘 사용 예산: {format_krw(daily_budget)}"
+                )
+            )
+            return
+
         # 후보 리스트 임베드
         desc_lines = []
-        for c in filtered:
+        for c in analysis_candidates:
             sig_str = ", ".join(c["signals"])
             desc_lines.append(
                 f"**{c['score']}점** {c['name']} (`{c['ticker']}`) "
                 f"— {c['price']:,}원 ({c['prdy_ctrt']:+.1f}%) | {sig_str}"
             )
         score_embed = discord.Embed(
-            title=f"🏆 멀티시그널 후보 TOP {len(filtered)}",
+            title=f"🏆 예산 반영 후보 TOP {len(analysis_candidates)}",
             description="\n".join(desc_lines),
             color=0x0066FF,
         )
         score_embed.set_footer(text=mode_label)
         await scoring_msg.edit(content=None, embed=score_embed)
 
+        analysis_tickers = {item["ticker"] for item in analysis_candidates}
+        expensive_skipped = [
+            c for c in filtered
+            if c["ticker"] not in analysis_tickers and float(c.get("price", 0) or 0) > preview_per_stock_budget
+        ]
+        if expensive_skipped:
+            skipped_names = ", ".join(f"{c['name']}({c['ticker']})" for c in expensive_skipped[:5])
+            extra = f" 외 {len(expensive_skipped) - 5}종목" if len(expensive_skipped) > 5 else ""
+            await channel.send(
+                "💡 **예산 기반 후보 조정**\n"
+                f"오늘 예산: {format_krw(daily_budget)}\n"
+                f"분석 대상: {len(analysis_candidates)}종목\n"
+                f"종목당 최소 예산: {format_krw(preview_per_stock_budget)}\n"
+                f"제외된 고가 종목: {skipped_names}{extra}"
+            )
+
         # ── 2) 상위 후보 순차 AI 분석 → BUY만 수집 ──
         buy_targets: list[dict] = []
         analyzed_count = 0
-        analysis_candidates = filtered[:DAY_TRADE_PICKS]
         for c in analysis_candidates:
 
             analyzed_count += 1
@@ -2400,6 +2503,8 @@ async def morning_auto_buy():
         try:
             balance_data = await loop.run_in_executor(None, kis.get_balance, "KR")
             cash = balance_data.get("summary", {}).get("cash", 0)
+            budget_info = _compute_auto_buy_budget("KR", cash)
+            daily_budget = int(budget_info["usable_budget"])
         except Exception as e:
             _log("ERROR", "AUTO_BUY_BALANCE_ERROR", str(e)[:200])
             await channel.send(f"❌ 잔액 조회 실패: {str(e)[:300]}")
@@ -2410,8 +2515,6 @@ async def morning_auto_buy():
             await channel.send("❌ 예수금이 0원입니다. 매수할 수 없습니다.")
             return
 
-        budget_info = _compute_auto_buy_budget("KR", cash)
-        daily_budget = int(budget_info["usable_budget"])
         if daily_budget <= 0:
             _log("WARN", "AUTO_BUY_NO_BUDGET", f"cash={cash} ratio={budget_info['ratio']}")
             await channel.send("❌ 오늘 사용할 자동매수 예산이 0원이라 매수를 건너뜁니다.")
@@ -2793,9 +2896,11 @@ async def us_morning_auto_buy():
             await scoring_msg.edit(content="❌ 미국 매수 후보가 없습니다.")
             return
 
+        cash = 0.0
         try:
             balance_data = await loop.run_in_executor(None, kis.get_balance, "US")
             held_tickers = {h["ticker"] for h in balance_data.get("holdings", [])}
+            cash = float(balance_data.get("summary", {}).get("USD", {}).get("cash", 0) or 0)
         except Exception:
             held_tickers = set()
 
@@ -2804,15 +2909,37 @@ async def us_morning_auto_buy():
             await scoring_msg.edit(content="📋 후보 종목이 모두 이미 보유 중입니다.")
             return
 
+        budget_info = _compute_auto_buy_budget("US", cash)
+        daily_budget = float(budget_info["usable_budget"])
+        if daily_budget <= 0:
+            _log("WARN", "US_AUTO_BUY_NO_BUDGET", f"cash={cash} ratio={budget_info['ratio']}")
+            await scoring_msg.edit(content="❌ 오늘 사용할 미국 자동매수 예산이 0이라 후보 분석을 건너뜁니다.")
+            return
+
+        analysis_candidates, preview_per_stock_budget = _select_affordable_candidates(
+            filtered,
+            daily_budget,
+            US_DAY_TRADE_PICKS,
+        )
+        if not analysis_candidates:
+            _log("WARN", "US_AUTO_BUY_NO_AFFORDABLE", f"filtered={len(filtered)} daily_budget={daily_budget}")
+            await scoring_msg.edit(
+                content=(
+                    "❌ 오늘 예산으로는 1주 이상 매수 가능한 미국 후보가 없습니다.\n"
+                    f"오늘 사용 예산: {_format_money(daily_budget, 'USD')}"
+                )
+            )
+            return
+
         desc_lines = []
-        for c in filtered:
+        for c in analysis_candidates:
             sig_str = ", ".join(c["signals"])
             desc_lines.append(
                 f"**{c['score']}점** {c['name']} (`{c['ticker']}`) "
                 f"— {_format_money(c['price'], 'USD')} ({c['prdy_ctrt']:+.2f}%) | {sig_str}"
             )
         score_embed = discord.Embed(
-            title=f"🇺🇸 워치리스트 후보 TOP {len(filtered)}",
+            title=f"🇺🇸 예산 반영 후보 TOP {len(analysis_candidates)}",
             description="\n".join(desc_lines),
             color=0x0066FF,
             timestamp=datetime.datetime.now(NY_TZ),
@@ -2820,9 +2947,24 @@ async def us_morning_auto_buy():
         score_embed.set_footer(text=f"{mode_label} | USD")
         await scoring_msg.edit(content=None, embed=score_embed)
 
+        analysis_tickers = {item["ticker"] for item in analysis_candidates}
+        expensive_skipped = [
+            c for c in filtered
+            if c["ticker"] not in analysis_tickers and float(c.get("price", 0) or 0) > preview_per_stock_budget
+        ]
+        if expensive_skipped:
+            skipped_names = ", ".join(f"{c['name']}({c['ticker']})" for c in expensive_skipped[:5])
+            extra = f" 외 {len(expensive_skipped) - 5}종목" if len(expensive_skipped) > 5 else ""
+            await channel.send(
+                "💡 **US 예산 기반 후보 조정**\n"
+                f"오늘 예산: {_format_money(daily_budget, 'USD')}\n"
+                f"분석 대상: {len(analysis_candidates)}종목\n"
+                f"종목당 최소 예산: {_format_money(preview_per_stock_budget, 'USD')}\n"
+                f"제외된 고가 종목: {skipped_names}{extra}"
+            )
+
         buy_targets: list[dict] = []
         analyzed_count = 0
-        analysis_candidates = filtered[:US_DAY_TRADE_PICKS]
         for c in analysis_candidates:
             analyzed_count += 1
             progress = await channel.send(
@@ -2890,6 +3032,8 @@ async def us_morning_auto_buy():
         try:
             balance_data = await loop.run_in_executor(None, kis.get_balance, "US")
             cash = balance_data.get("summary", {}).get("USD", {}).get("cash", 0)
+            budget_info = _compute_auto_buy_budget("US", cash)
+            daily_budget = float(budget_info["usable_budget"])
         except Exception as e:
             _log("ERROR", "US_AUTO_BUY_BALANCE_ERROR", str(e)[:200])
             await channel.send(f"❌ USD 잔액 조회 실패: {str(e)[:300]}")
@@ -2899,8 +3043,6 @@ async def us_morning_auto_buy():
             await channel.send("❌ USD 예수금이 0입니다. 매수를 건너뜁니다.")
             return
 
-        budget_info = _compute_auto_buy_budget("US", cash)
-        daily_budget = float(budget_info["usable_budget"])
         if daily_budget <= 0:
             _log("WARN", "US_AUTO_BUY_NO_BUDGET", f"cash={cash} ratio={budget_info['ratio']}")
             await channel.send("❌ 오늘 사용할 미국 자동매수 예산이 0이라 매수를 건너뜁니다.")
